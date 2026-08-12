@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::OnceLock;
 
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use futures_util::StreamExt;
@@ -14,6 +15,21 @@ const BLUE: &str = "\x1b[34m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
+
+// Set once at startup: color is on by default, off with --no-color. (Tools
+// like fzf can display ANSI-colored input fine via their own --ansi flag,
+// so this doesn't need to auto-disable based on whether stdout is a TTY.)
+static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn color_enabled() -> bool {
+    *COLOR_ENABLED.get().unwrap_or(&false)
+}
+
+// Returns `code` if color is enabled, otherwise "" — wrap every color/reset
+// constant with this instead of using them directly.
+fn c(code: &'static str) -> &'static str {
+    if color_enabled() { code } else { "" }
+}
 
 #[derive(Debug, Deserialize)]
 struct RtmConnectResponse {
@@ -32,17 +48,20 @@ struct HistMessage {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut verbose = false;
+    let mut no_color = false;
     let mut backfill_arg: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-v" | "--verbose" => verbose = true,
+            "--no-color" => no_color = true,
             "-t" | "--time" => {
                 backfill_arg = Some(args.next().ok_or("missing value for -t (e.g. -t 1h)")?);
             }
             _ => {}
         }
     }
+    COLOR_ENABLED.set(!no_color).ok();
 
     dotenvy::dotenv().ok(); // fine if there's no .env — vars may already be set in the environment
 
@@ -380,6 +399,8 @@ fn format_slack_ts(ts: &str) -> String {
 // #foo (or the resolved channel name), <!here>/<!channel>/<!everyone> ->
 // @here/@channel/@everyone. Links (<https://...|label>) are left untouched.
 fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &HashMap<String, String>) -> String {
+    let yellow = c(YELLOW);
+    let reset = c(RESET);
     let mut result = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -391,14 +412,14 @@ fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &Hash
                     Some(b'@') => {
                         let id = inner[1..].split('|').next().unwrap_or(&inner[1..]);
                         let name = users.get(id).cloned().unwrap_or_else(|| id.to_string());
-                        Some(format!("{YELLOW}@{name}{RESET}"))
+                        Some(format!("{yellow}@{name}{reset}"))
                     }
                     Some(b'#') => {
                         let id = inner[1..].split('|').next().unwrap_or(&inner[1..]);
                         let name = channels.get(id).cloned().unwrap_or_else(|| format!("#{id}"));
-                        Some(format!("{YELLOW}{name}{RESET}"))
+                        Some(format!("{yellow}{name}{reset}"))
                     }
-                    Some(b'!') => Some(format!("{YELLOW}@{}{RESET}", &inner[1..])), // here/channel/everyone
+                    Some(b'!') => Some(format!("{yellow}@{}{reset}", &inner[1..])), // here/channel/everyone
                     _ => None,
                 };
                 if let Some(rep) = replacement {
@@ -415,6 +436,208 @@ fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &Hash
     result
 }
 
+// Slack escapes these three characters in message text (mainly so literal
+// "<"/">" in a human's message can't be confused with the <@...>/<#...>
+// syntax) — must run *after* resolve_mentions, which relies on that syntax
+// still being intact literal angle brackets at the point it runs.
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+// Replaces :shortcode: with the matching emoji when it's a name we know.
+// Unrecognized shortcodes (workspace-custom emoji, typos, skin-tone
+// modifiers, etc.) are left exactly as-is rather than guessed at.
+fn resolve_emoji(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text.as_bytes()[i] == b':' {
+            if let Some(rel_end) = text[i + 1..].find(':') {
+                let end = i + 1 + rel_end;
+                let name = &text[i + 1..end];
+                let looks_like_shortcode = !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '-');
+                if looks_like_shortcode {
+                    if let Some(emoji) = emoji_for(name) {
+                        result.push_str(emoji);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+    result
+}
+
+// A curated set of the most common Slack emoji shortcodes — not exhaustive
+// (no workspace-custom emoji, no skin-tone variants, no every-single-emoji
+// coverage), just enough that everyday chat renders instead of showing
+// ":shortcode:" text.
+fn emoji_for(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "smile" | "smiley" => "😄",
+        "grin" => "😁",
+        "grinning" => "😀",
+        "laughing" | "satisfied" => "😆",
+        "joy" => "😂",
+        "rofl" | "rolling_on_the_floor_laughing" => "🤣",
+        "blush" => "😊",
+        "wink" => "😉",
+        "slightly_smiling_face" => "🙂",
+        "upside_down_face" => "🙃",
+        "relieved" => "😌",
+        "heart_eyes" => "😍",
+        "kissing_heart" => "😘",
+        "yum" => "😋",
+        "sunglasses" => "😎",
+        "smirk" => "😏",
+        "unamused" => "😒",
+        "thinking_face" | "thinking" => "🤔",
+        "neutral_face" => "😐",
+        "expressionless" => "😑",
+        "no_mouth" => "😶",
+        "roll_eyes" => "🙄",
+        "confused" => "😕",
+        "worried" => "😟",
+        "slightly_frowning_face" => "🙁",
+        "frowning_face" => "☹️",
+        "open_mouth" => "😮",
+        "hushed" => "😯",
+        "astonished" => "😲",
+        "flushed" => "😳",
+        "pleading_face" => "🥺",
+        "cry" => "😢",
+        "sob" => "😭",
+        "disappointed" => "😞",
+        "persevere" => "😣",
+        "confounded" => "😖",
+        "tired_face" => "😫",
+        "weary" => "😩",
+        "triumph" => "😤",
+        "angry" => "😠",
+        "rage" => "😡",
+        "dizzy_face" => "😵",
+        "scream" => "😱",
+        "fearful" => "😨",
+        "cold_sweat" => "😰",
+        "sweat_smile" => "😅",
+        "sweat" => "😓",
+        "sleepy" => "😪",
+        "sleeping" => "😴",
+        "zzz" => "💤",
+        "mask" => "😷",
+        "nauseated_face" => "🤢",
+        "sneezing_face" => "🤧",
+        "innocent" => "😇",
+        "smiling_imp" => "😈",
+        "imp" => "👿",
+        "japanese_ogre" => "👹",
+        "skull" => "💀",
+        "ghost" => "👻",
+        "alien" => "👽",
+        "robot_face" => "🤖",
+        "poop" | "hankey" | "shit" => "💩",
+        "clown_face" => "🤡",
+        "smiley_cat" | "cat" => "🐱",
+        "wave" => "👋",
+        "raised_hand" | "hand" => "✋",
+        "ok_hand" => "👌",
+        "thumbsup" | "+1" => "👍",
+        "thumbsdown" | "-1" => "👎",
+        "fist" | "fist_raised" => "✊",
+        "punch" | "fist_oncoming" => "👊",
+        "clap" => "👏",
+        "raised_hands" => "🙌",
+        "pray" => "🙏",
+        "muscle" => "💪",
+        "point_up" => "☝️",
+        "point_down" => "👇",
+        "point_left" => "👈",
+        "point_right" => "👉",
+        "v" => "✌️",
+        "crossed_fingers" => "🤞",
+        "handshake" => "🤝",
+        "heart" => "❤️",
+        "orange_heart" => "🧡",
+        "yellow_heart" => "💛",
+        "green_heart" => "💚",
+        "blue_heart" => "💙",
+        "purple_heart" => "💜",
+        "black_heart" => "🖤",
+        "broken_heart" => "💔",
+        "two_hearts" => "💕",
+        "sparkling_heart" => "💖",
+        "heartbeat" => "💓",
+        "100" => "💯",
+        "fire" => "🔥",
+        "star" => "⭐",
+        "star2" => "🌟",
+        "sparkles" => "✨",
+        "tada" => "🎉",
+        "confetti_ball" => "🎊",
+        "rocket" => "🚀",
+        "eyes" => "👀",
+        "eye" => "👁️",
+        "warning" => "⚠️",
+        "exclamation" => "❗",
+        "question" => "❓",
+        "white_check_mark" | "heavy_check_mark" | "check" => "✅",
+        "x" => "❌",
+        "heavy_plus_sign" => "➕",
+        "heavy_minus_sign" => "➖",
+        "zap" => "⚡",
+        "boom" | "collision" => "💥",
+        "bulb" => "💡",
+        "coffee" => "☕",
+        "beer" | "beers" => "🍺",
+        "pizza" => "🍕",
+        "cake" => "🍰",
+        "birthday" => "🎂",
+        "gift" => "🎁",
+        "trophy" => "🏆",
+        "medal" | "sports_medal" => "🏅",
+        "checkered_flag" => "🏁",
+        "bell" => "🔔",
+        "no_bell" => "🔕",
+        "lock" => "🔒",
+        "unlock" => "🔓",
+        "key" => "🔑",
+        "hourglass" => "⌛",
+        "hourglass_flowing_sand" => "⏳",
+        "clock1" | "clock" => "🕐",
+        "calendar" => "📅",
+        "email" | "envelope" => "✉️",
+        "phone" => "📞",
+        "computer" => "💻",
+        "moneybag" => "💰",
+        "gem" => "💎",
+        "raised_eyebrow" => "🤨",
+        "shrug" => "🤷",
+        "facepalm" => "🤦",
+        "wave_hand" => "👋",
+        "loudspeaker" => "📢",
+        "mega" => "📣",
+        "speech_balloon" => "💬",
+        "thought_balloon" => "💭",
+        "arrow_right" => "➡️",
+        "arrow_left" => "⬅️",
+        "arrow_up" => "⬆️",
+        "arrow_down" => "⬇️",
+        "recycle" => "♻️",
+        "new" => "🆕",
+        "ok" => "🆗",
+        "sos" => "🆘",
+        "up" => "🆙",
+        "us" | "flag-us" => "🇺🇸",
+        "de" | "flag-de" => "🇩🇪",
+        _ => return None,
+    })
+}
+
 fn print_message(
     ts: &str,
     channel_id: &str,
@@ -427,7 +650,10 @@ fn print_message(
     let user_name = users.get(user_id).cloned().unwrap_or_else(|| user_id.to_string());
     let time = format_slack_ts(ts);
     let text = resolve_mentions(text, channels, users);
-    println!("{GREEN}[{time}]{RESET} {BLUE}[{channel_name}]{RESET} {CYAN}{user_name}{RESET}: {text}");
+    let text = decode_html_entities(&text);
+    let text = resolve_emoji(&text);
+    let (green, blue, cyan, reset) = (c(GREEN), c(BLUE), c(CYAN), c(RESET));
+    println!("{green}[{time}]{reset} {blue}[{channel_name}]{reset} {cyan}{user_name}{reset}: {text}");
 }
 
 fn handle_event(event: &Value, verbose: bool, channels: &HashMap<String, String>, users: &HashMap<String, String>) {
