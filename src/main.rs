@@ -1,22 +1,18 @@
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chrono::{Local, TimeZone};
+use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::COOKIE;
 
-const MAX_CONCURRENT_HISTORY_FETCHES: usize = 15;
-
 const GREEN: &str = "\x1b[32m";
 const BLUE: &str = "\x1b[34m";
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Deserialize)]
@@ -125,11 +121,12 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
-// Fetches every channel's history since `now - duration` concurrently
-// (bounded, so we don't blast Slack with 200 simultaneous requests), prints a
-// live-updating progress line while that's in flight, then — once every
-// channel has reported — sorts the whole batch by timestamp and prints it in
-// true chronological order.
+// Backfills via search.messages instead of iterating conversations.history
+// per-channel: a single global, paginated query instead of ~200 individual
+// calls, and — crucially — search indexes thread replies too. (History-per-
+// channel only surfaces a thread if its *parent's own* timestamp falls in the
+// requested window; an old thread with a brand-new reply would be invisible
+// to it, since the parent that carries reply_count never gets returned.)
 async fn backfill(
     client: &reqwest::Client,
     token: &str,
@@ -145,39 +142,7 @@ async fn backfill(
         .ok_or("duration too large")?
         .as_secs_f64();
 
-    let total = channels.len();
-    let done = Arc::new(AtomicUsize::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HISTORY_FETCHES));
-
-    eprint!("\rLoading history since {label}: 0/{total} channels...");
-    std::io::stderr().flush().ok();
-
-    let mut set = JoinSet::new();
-    for channel_id in channels.keys().cloned() {
-        let client = client.clone();
-        let token = token.to_string();
-        let cookie = cookie.to_string();
-        let sem = semaphore.clone();
-        let done = done.clone();
-        let label = label.to_string();
-        set.spawn(async move {
-            let _permit = sem.acquire_owned().await.unwrap();
-            let result = fetch_channel_history(&client, &token, &cookie, &channel_id, oldest).await;
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            eprint!("\rLoading history since {label}: {n}/{total} channels...");
-            std::io::stderr().flush().ok();
-            result
-        });
-    }
-
-    let mut all_messages = Vec::new();
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(Ok(mut msgs)) => all_messages.append(&mut msgs),
-            Ok(Err(e)) => eprintln!("\nWarning: a channel failed to load: {e}"),
-            Err(e) => eprintln!("\nWarning: a fetch task panicked: {e}"),
-        }
-    }
+    let mut all_messages = search_messages_since(client, token, cookie, oldest, label).await?;
     eprintln!(); // finish the progress line
 
     all_messages.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
@@ -189,38 +154,53 @@ async fn backfill(
     Ok(())
 }
 
-async fn fetch_channel_history(
+// Slack's search "after:" modifier only has day granularity, so we ask for
+// one extra day of margin and then filter precisely by `oldest` ourselves —
+// exact regardless of timezone/day-boundary edges.
+async fn search_messages_since(
     client: &reqwest::Client,
     token: &str,
     cookie: &str,
-    channel_id: &str,
     oldest: f64,
+    label: &str,
 ) -> Result<Vec<HistMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    let oldest_dt = Local.timestamp_opt(oldest as i64, 0).single().ok_or("bad oldest timestamp")?;
+    let after_date = (oldest_dt - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
+    let query = format!("after:{after_date}");
+
     let mut messages = Vec::new();
-    let mut cursor: Option<String> = None;
-
+    let mut page = 1u32;
     loop {
-        let mut url = format!(
-            "https://slack.com/api/conversations.history?channel={}&oldest={oldest:.6}&limit=200",
-            urlencoding::encode(channel_id),
-        );
-        if let Some(c) = &cursor {
-            url += &format!("&cursor={}", urlencoding::encode(c));
-        }
+        eprint!("\rSearching history since {label}: page {page}, {} message(s) so far...", messages.len());
+        std::io::stderr().flush().ok();
 
+        let url = format!(
+            "https://slack.com/api/search.messages?query={}&count=100&page={page}&sort=timestamp&sort_dir=asc",
+            urlencoding::encode(&query),
+        );
         let resp = slack_get(client, token, cookie, &url).await?;
-        let items = resp.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
-        if items.is_empty() {
+
+        let matches = resp
+            .get("messages")
+            .and_then(|m| m.get("matches"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if matches.is_empty() {
             break;
         }
 
-        for item in &items {
-            let user_id = item.get("user").and_then(Value::as_str).unwrap_or_default();
-            if user_id.is_empty() {
-                continue; // e.g. bot messages without a user id
-            }
+        for item in &matches {
             let ts_str = item.get("ts").and_then(Value::as_str).unwrap_or_default();
             let Some(ts) = ts_str.parse::<f64>().ok() else { continue };
+            if ts < oldest {
+                continue; // outside the exact window — the day-granularity query is coarser
+            }
+            let user_id = item.get("user").and_then(Value::as_str).unwrap_or_default();
+            if user_id.is_empty() {
+                continue;
+            }
+            let channel_id = item.get("channel").and_then(|c| c.get("id")).and_then(Value::as_str).unwrap_or_default();
             let text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
             messages.push(HistMessage {
                 ts,
@@ -230,10 +210,16 @@ async fn fetch_channel_history(
             });
         }
 
-        cursor = next_cursor(&resp);
-        if cursor.is_none() {
+        let page_count = resp
+            .get("messages")
+            .and_then(|m| m.get("pagination"))
+            .and_then(|p| p.get("page_count"))
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        if (page as i64) >= page_count {
             break;
         }
+        page += 1;
     }
 
     Ok(messages)
@@ -404,13 +390,15 @@ fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &Hash
                 let replacement = match inner.as_bytes().first() {
                     Some(b'@') => {
                         let id = inner[1..].split('|').next().unwrap_or(&inner[1..]);
-                        Some(format!("@{}", users.get(id).cloned().unwrap_or_else(|| id.to_string())))
+                        let name = users.get(id).cloned().unwrap_or_else(|| id.to_string());
+                        Some(format!("{YELLOW}@{name}{RESET}"))
                     }
                     Some(b'#') => {
                         let id = inner[1..].split('|').next().unwrap_or(&inner[1..]);
-                        Some(channels.get(id).cloned().unwrap_or_else(|| format!("#{id}")))
+                        let name = channels.get(id).cloned().unwrap_or_else(|| format!("#{id}"));
+                        Some(format!("{YELLOW}{name}{RESET}"))
                     }
-                    Some(b'!') => Some(format!("@{}", &inner[1..])), // here/channel/everyone
+                    Some(b'!') => Some(format!("{YELLOW}@{}{RESET}", &inner[1..])), // here/channel/everyone
                     _ => None,
                 };
                 if let Some(rep) = replacement {
@@ -439,7 +427,7 @@ fn print_message(
     let user_name = users.get(user_id).cloned().unwrap_or_else(|| user_id.to_string());
     let time = format_slack_ts(ts);
     let text = resolve_mentions(text, channels, users);
-    println!("{GREEN}[{time}]{RESET} {BLUE}[{channel_name}]{RESET} {user_name}: {text}");
+    println!("{GREEN}[{time}]{RESET} {BLUE}[{channel_name}]{RESET} {CYAN}{user_name}{RESET}: {text}");
 }
 
 fn handle_event(event: &Value, verbose: bool, channels: &HashMap<String, String>, users: &HashMap<String, String>) {
