@@ -1,39 +1,46 @@
 # myslackcli
 
-Standalone Slack CLI client — connects to Slack's real-time message stream
-(the same internal WebSocket mechanism the official web client uses) instead
-of polling the REST API, so messages show up in the terminal as they happen.
+Just a fun little Slack client. Does not use the official API (registered
+app, OAuth, the works) — it piggybacks on your own logged-in browser
+session instead, the same way Slack's own web client talks to its servers.
+This is unofficial, reverse-engineered territory: it can break at any moment
+if Slack changes something internally. Use at your own risk, don't rely on
+it for anything important.
 
 ## Setup
 
 ```bash
 cp .env.example .env
-# fill in SLACK_TOKEN (xoxc-...) and SLACK_COOKIE (xoxd-..., the "d" cookie)
+# fill in SLACK_TOKEN and SLACK_COOKIE below
 cargo run
 ```
 
-See `../parade/README.md` ("Messenger POC") for how to grab a browser
-session token/cookie from your own logged-in `app.slack.com` session via
-DevTools — same credentials work here.
+## Getting a token & cookie
 
-## How it connects
+1. Log into `app.slack.com` in your browser, open the workspace you want.
+2. Open DevTools (F12) → **Console** tab, run:
+   ```js
+   JSON.parse(localStorage.localConfig_v2).teams[Object.keys(JSON.parse(localStorage.localConfig_v2).teams)[0]].token
+   ```
+   That's your `SLACK_TOKEN` (starts with `xoxc-`).
+3. DevTools → **Application** tab → **Cookies** → `https://app.slack.com` →
+   find the cookie named **`d`** → copy its value. That's your
+   `SLACK_COOKIE` (starts with `xoxd-`).
 
-Calls the officially documented `rtm.connect` Web API method (same
-Bearer-token + cookie auth as any other Slack Web API call) to get a
-short-lived `wss://` URL, then opens a WebSocket to it and prints every
-`message` event as `[channel] user: text`.
+Both are full session credentials for your own account — don't share them,
+don't commit `.env` (it's gitignored already).
 
-`rtm.connect`/RTM is marked legacy for new OAuth app registrations (Slack
-pushes those toward the Events API instead), but it's what the official
-clients still use internally for session-token connections — this is
-unofficial/reverse-engineered territory, not a documented integration path,
-so it can break without notice. If `rtm.connect` ever stops accepting
-session tokens, the fallback is the approach used by
-[wee-slack](https://github.com/wee-slack/wee-slack): resolve team info, then
-connect directly to `wss://wss-primary.slack.com/?token=...`.
+## Usage
 
-## Status
+```bash
+./myslackcli                  # live stream of every channel/DM you're in
+./myslackcli -t 1h            # also backfill the last hour first, then go live
+./myslackcli -v               # show connection/lifecycle chatter too
+./myslackcli --no-color       # plain text, no ANSI colors
+```
 
-First vertical slice: connect, stream raw `message` events for every
-channel/DM the token can see, print channel/user IDs as-is (no name
-resolution yet).
+Pipes nicely into a pager or fuzzy-finder:
+```bash
+./myslackcli | less -RF       # -R for colors, -F to follow like tail -f
+./myslackcli | fzf --no-sort --tac --ansi # fuzzy-search the live stream
+```
