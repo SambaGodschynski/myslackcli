@@ -392,7 +392,7 @@ async fn fetch_rtm_url(
 fn format_slack_ts(ts: &str) -> String {
     let seconds = ts.parse::<f64>().ok();
     let datetime = seconds.and_then(|s| Local.timestamp_opt(s as i64, 0).single());
-    datetime.unwrap_or_else(Local::now).format("%H:%M:%S").to_string()
+    datetime.unwrap_or_else(Local::now).format("%d.%m.%y %H:%M:%S").to_string()
 }
 
 // Resolves Slack's inline reference syntax: <@U123> -> @Name, <#C123|foo> ->
