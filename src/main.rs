@@ -41,6 +41,11 @@ struct RtmConnectResponse {
 
 struct HistMessage {
     ts: f64,
+    // The unparsed "1690000000.000100" form. Kept alongside the f64 because
+    // thread_tag() hashes this string verbatim: a parent identified via its
+    // own ts must hash identically to the thread_ts its replies carry, and a
+    // round-trip through f64 doesn't reliably reproduce the original digits.
+    ts_raw: String,
     channel_id: String,
     user_id: String,
     text: String,
@@ -167,11 +172,12 @@ async fn backfill(
     eprintln!(); // finish the progress line
 
     all_messages.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+    tag_thread_parents(&mut all_messages);
 
     println!("--- {} historical message(s) since {label} ---", all_messages.len());
     for m in &all_messages {
         print_message(
-            &m.ts.to_string(),
+            &m.ts_raw,
             &m.channel_id,
             &m.user_id,
             &m.text,
@@ -181,6 +187,31 @@ async fn backfill(
         );
     }
     Ok(())
+}
+
+// A thread parent carries no thread_ts of its own — Slack identifies it purely
+// by the fact that the replies' thread_ts equals the parent's ts. Nothing in a
+// single match reveals that, but across the whole result set it's recoverable:
+// collect every (channel, thread_ts) the replies point at, then tag any message
+// whose own (channel, ts) is one of them. Purely local, no extra API calls.
+//
+// A parent older than the backfill window simply isn't in `messages` at all, so
+// there's nothing to tag — its replies still get the ID and stay groupable.
+fn tag_thread_parents(messages: &mut [HistMessage]) {
+    let threads: std::collections::HashSet<(&str, &str)> = messages
+        .iter()
+        .filter_map(|m| m.thread_ts.as_deref().map(|t| (m.channel_id.as_str(), t)))
+        .collect();
+    // Same borrow of `messages` can't be held while mutating, so decide first.
+    let parents: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.thread_ts.is_none() && threads.contains(&(m.channel_id.as_str(), m.ts_raw.as_str())))
+        .map(|(i, _)| i)
+        .collect();
+    for i in parents {
+        messages[i].thread_ts = Some(messages[i].ts_raw.clone());
+    }
 }
 
 // Slack's search "after:" modifier only has day granularity, so we ask for
@@ -238,6 +269,7 @@ async fn search_messages_since(
                 .or_else(|| item.get("permalink").and_then(Value::as_str).and_then(thread_ts_from_permalink));
             messages.push(HistMessage {
                 ts,
+                ts_raw: ts_str.to_string(),
                 channel_id: channel_id.to_string(),
                 user_id: user_id.to_string(),
                 text,
