@@ -14,6 +14,7 @@ const GREEN: &str = "\x1b[32m";
 const BLUE: &str = "\x1b[34m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
+const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
 
 // Set once at startup: color is on by default, off with --no-color. (Tools
@@ -43,6 +44,7 @@ struct HistMessage {
     channel_id: String,
     user_id: String,
     text: String,
+    thread_ts: Option<String>,
 }
 
 #[tokio::main]
@@ -168,7 +170,15 @@ async fn backfill(
 
     println!("--- {} historical message(s) since {label} ---", all_messages.len());
     for m in &all_messages {
-        print_message(&m.ts.to_string(), &m.channel_id, &m.user_id, &m.text, channels, users);
+        print_message(
+            &m.ts.to_string(),
+            &m.channel_id,
+            &m.user_id,
+            &m.text,
+            m.thread_ts.as_deref(),
+            channels,
+            users,
+        );
     }
     Ok(())
 }
@@ -221,11 +231,17 @@ async fn search_messages_since(
             }
             let channel_id = item.get("channel").and_then(|c| c.get("id")).and_then(Value::as_str).unwrap_or_default();
             let text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            let thread_ts = item
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| item.get("permalink").and_then(Value::as_str).and_then(thread_ts_from_permalink));
             messages.push(HistMessage {
                 ts,
                 channel_id: channel_id.to_string(),
                 user_id: user_id.to_string(),
                 text,
+                thread_ts,
             });
         }
 
@@ -393,6 +409,40 @@ fn format_slack_ts(ts: &str) -> String {
     let seconds = ts.parse::<f64>().ok();
     let datetime = seconds.and_then(|s| Local.timestamp_opt(s as i64, 0).single());
     datetime.unwrap_or_else(Local::now).format("%d.%m.%y %H:%M:%S").to_string()
+}
+
+// Slack's own thread identity is (channel, thread_ts) — far too long to scan
+// by eye. This folds it into 4 base36 characters via FNV-1a, which is stable
+// across runs and across the two code paths (live RTM and search backfill),
+// so `t:xxxx` in fzf pulls up every message of the same thread. 4 chars is
+// ~1.7M buckets: collisions are conceivable but harmless here (worst case a
+// filter shows one unrelated thread alongside the intended one).
+fn thread_tag(channel_id: &str, thread_ts: &str) -> String {
+    const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in channel_id.bytes().chain(thread_ts.bytes()) {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let mut out = [0u8; 4];
+    for slot in out.iter_mut().rev() {
+        *slot = BASE36[(hash % 36) as usize];
+        hash /= 36;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// search.messages doesn't return thread_ts as a field, but the permalink of a
+// reply carries it as a query parameter:
+//   https://team.slack.com/archives/C123/p169...?thread_ts=1690000000.000100&cid=C123
+// Messages that aren't in a thread have no such parameter.
+fn thread_ts_from_permalink(permalink: &str) -> Option<String> {
+    let query = permalink.split('?').nth(1)?;
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix("thread_ts="))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 // Resolves Slack's inline reference syntax: <@U123> -> @Name, <#C123|foo> ->
@@ -643,6 +693,7 @@ fn print_message(
     channel_id: &str,
     user_id: &str,
     text: &str,
+    thread_ts: Option<&str>,
     channels: &HashMap<String, String>,
     users: &HashMap<String, String>,
 ) {
@@ -652,8 +703,12 @@ fn print_message(
     let text = resolve_mentions(text, channels, users);
     let text = decode_html_entities(&text);
     let text = resolve_emoji(&text);
-    let (green, blue, cyan, reset) = (c(GREEN), c(BLUE), c(CYAN), c(RESET));
-    println!("{green}[{time}]{reset} {blue}[{channel_name}]{reset} {cyan}{user_name}{reset}: {text}");
+    let (green, blue, cyan, magenta, reset) = (c(GREEN), c(BLUE), c(CYAN), c(MAGENTA), c(RESET));
+    let thread = match thread_ts {
+        Some(t) => format!(" {magenta}[t:{}]{reset}", thread_tag(channel_id, t)),
+        None => String::new(),
+    };
+    println!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {text}");
 }
 
 fn handle_event(event: &Value, verbose: bool, channels: &HashMap<String, String>, users: &HashMap<String, String>) {
@@ -665,7 +720,10 @@ fn handle_event(event: &Value, verbose: bool, channels: &HashMap<String, String>
             let user_id = event.get("user").and_then(Value::as_str).unwrap_or("?");
             let text = event.get("text").and_then(Value::as_str).unwrap_or("");
             let ts = event.get("ts").and_then(Value::as_str).unwrap_or("");
-            print_message(ts, channel_id, user_id, text, channels, users);
+            // Present on every reply, and on the parent itself once it has
+            // replies — so a live thread shows the same tag on both.
+            let thread_ts = event.get("thread_ts").and_then(Value::as_str);
+            print_message(ts, channel_id, user_id, text, thread_ts, channels, users);
         }
         "hello" if verbose => println!("(connected — hello received)"),
         "" => {} // no type field (e.g. reply acknowledgements) — ignore
