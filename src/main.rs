@@ -1,3 +1,5 @@
+mod store;
+
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::OnceLock;
@@ -9,6 +11,8 @@ use serde_json::Value;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::COOKIE;
+
+use store::{ChannelRow, Store, StoredMessage};
 
 const GREEN: &str = "\x1b[32m";
 const BLUE: &str = "\x1b[34m";
@@ -57,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut verbose = false;
     let mut no_color = false;
     let mut backfill_arg: Option<String> = None;
+    let mut sql_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -64,6 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "--no-color" => no_color = true,
             "-t" | "--time" => {
                 backfill_arg = Some(args.next().ok_or("missing value for -t (e.g. -t 1h)")?);
+            }
+            "--sql" => {
+                sql_path = Some(args.next().ok_or("missing value for --sql (e.g. --sql=slack.db)")?);
+            }
+            other if other.starts_with("--sql=") => {
+                sql_path = Some(other.trim_start_matches("--sql=").to_string());
             }
             _ => {}
         }
@@ -81,44 +92,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("Resolving users/channels...");
     }
     let users = fetch_users(&client, &token, &cookie).await?;
-    let channels = fetch_channels(&client, &token, &cookie, &users).await?;
+    let channel_rows = fetch_channels(&client, &token, &cookie, &users).await?;
+    let channels: HashMap<String, String> =
+        channel_rows.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
     if verbose {
         println!("{} user(s), {} channel(s)/DM(s) resolved", users.len(), channels.len());
     }
 
+    // Without --sql this stays None and not a single write happens.
+    let store = match &sql_path {
+        Some(path) => {
+            let store = Store::open(path)?;
+            store.sync_users(&users)?;
+            store.sync_channels(&channel_rows)?;
+            if verbose {
+                println!("Storing messages in {path}");
+            }
+            Some(store)
+        }
+        None => None,
+    };
+
+    // Ctrl+C races the actual work instead of killing the process, so the run
+    // ends by falling out of main: the database gets closed properly and a
+    // half-written statement can't be left behind. The backfill is covered too,
+    // not just the stream — its paginated search is where a run spends the most
+    // time, and so where an interrupt is most likely to land.
+    let mut interrupted = false;
+
     if let Some(t_str) = &backfill_arg {
         let duration = parse_duration(t_str).ok_or_else(|| format!("invalid -t value: {t_str:?} (try e.g. 1h, 30m, 2d)"))?;
-        backfill(&client, &token, &cookie, &channels, &users, duration, t_str).await?;
-    }
-
-    let ws_url = fetch_rtm_url(&client, &token, &cookie).await?;
-    if verbose {
-        println!("Connecting to {ws_url}...");
-    }
-
-    let mut request = ws_url.clone().into_client_request()?;
-    request.headers_mut().insert(COOKIE, format!("d={cookie}").parse()?);
-
-    let (ws_stream, _) = connect_async(request).await?;
-    if verbose {
-        println!("Connected. Streaming messages from all channels/DMs (Ctrl+C to quit)...\n");
-    }
-
-    let (_, mut read) = ws_stream.split();
-
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("WebSocket error: {e}");
-                break;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // The window is written in one transaction at the end, so an
+                // interrupt here stores nothing rather than a partial window.
+                eprintln!("\nInterrupted during backfill — nothing stored.");
+                interrupted = true;
             }
-        };
+            result = backfill(&client, &token, &cookie, &channels, &users, duration, t_str, store.as_ref()) => result?,
+        }
+    }
 
-        let Ok(text) = msg.to_text() else { continue };
-        let Ok(event) = serde_json::from_str::<Value>(text) else { continue };
+    if !interrupted {
+        let ws_url = fetch_rtm_url(&client, &token, &cookie).await?;
+        if verbose {
+            println!("Connecting to {ws_url}...");
+        }
 
-        handle_event(&event, verbose, &channels, &users);
+        let mut request = ws_url.clone().into_client_request()?;
+        request.headers_mut().insert(COOKIE, format!("d={cookie}").parse()?);
+
+        let (ws_stream, _) = connect_async(request).await?;
+        if verbose {
+            println!("Connected. Streaming messages from all channels/DMs (Ctrl+C to quit)...\n");
+        }
+
+        let (_, mut read) = ws_stream.split();
+
+        loop {
+            let msg = tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                msg = read.next() => msg,
+            };
+            // None means Slack closed the socket on us — also a reason to stop.
+            let Some(msg) = msg else { break };
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("WebSocket error: {e}");
+                    break;
+                }
+            };
+
+            let Ok(text) = msg.to_text() else { continue };
+            let Ok(event) = serde_json::from_str::<Value>(text) else { continue };
+
+            handle_event(&event, verbose, &channels, &users, store.as_ref());
+        }
+    }
+
+    // Closing by hand rather than leaving it to drop, so a failure to flush is
+    // reported instead of silently swallowed.
+    if let Some(store) = store {
+        if let Err(e) = store.close() {
+            eprintln!("closing the database failed: {e}");
+        }
+    }
+    if verbose {
+        println!("Stopped.");
     }
 
     Ok(())
@@ -161,6 +222,7 @@ async fn backfill(
     users: &HashMap<String, String>,
     duration: std::time::Duration,
     label: &str,
+    store: Option<&Store>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let oldest = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -185,6 +247,34 @@ async fn backfill(
             channels,
             users,
         );
+    }
+
+    if let Some(store) = store {
+        // Both the tags and the resolved texts have to outlive the borrows held
+        // by StoredMessage, so they're materialised before the rows are built.
+        let tags: Vec<Option<String>> = all_messages
+            .iter()
+            .map(|m| m.thread_ts.as_deref().map(|t| thread_tag(&m.channel_id, t)))
+            .collect();
+        let texts: Vec<String> = all_messages
+            .iter()
+            .map(|m| resolve_mentions_plain(&m.text, channels, users))
+            .collect();
+        let rows: Vec<StoredMessage> = all_messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| StoredMessage {
+                channel_id: &m.channel_id,
+                ts: &m.ts_raw,
+                user_id: Some(m.user_id.as_str()),
+                text: &texts[i],
+                thread_ts: m.thread_ts.as_deref(),
+                thread_tag: tags[i].as_deref(),
+                // Taken from the raw text, which still has the ids in it.
+                mentions: extract_mentions(&m.text),
+            })
+            .collect();
+        store.save_batch(&rows)?;
     }
     Ok(())
 }
@@ -362,13 +452,16 @@ async fn fetch_users(
     Ok(users)
 }
 
+// Returns rows rather than a name map so the display name and the channel's
+// kind stay together: a DM is recorded as a channel of kind 'dm' rather than as
+// a separate concept, which keeps every message referencing exactly one channel.
 async fn fetch_channels(
     client: &reqwest::Client,
     token: &str,
     cookie: &str,
     users: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut channels = HashMap::new();
+) -> Result<Vec<ChannelRow>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut channels = Vec::new();
     let mut cursor: Option<String> = None;
 
     loop {
@@ -389,15 +482,15 @@ async fn fetch_channels(
                 continue;
             }
             let name = item.get("name").and_then(Value::as_str).filter(|s| !s.is_empty());
-            let display = if let Some(n) = name {
-                format!("#{n}")
+            let (display, kind) = if let Some(n) = name {
+                (format!("#{n}"), "channel")
             } else if let Some(dm_user) = item.get("user").and_then(Value::as_str) {
                 let uname = users.get(dm_user).cloned().unwrap_or_else(|| dm_user.to_string());
-                format!("DM: {uname}")
+                (format!("DM: {uname}"), "dm")
             } else {
-                id.to_string()
+                (id.to_string(), "unknown")
             };
-            channels.insert(id.to_string(), display);
+            channels.push(ChannelRow { id: id.to_string(), name: display, kind });
         }
 
         cursor = next_cursor(&resp);
@@ -481,8 +574,29 @@ fn thread_ts_from_permalink(permalink: &str) -> Option<String> {
 // #foo (or the resolved channel name), <!here>/<!channel>/<!everyone> ->
 // @here/@channel/@everyone. Links (<https://...|label>) are left untouched.
 fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &HashMap<String, String>) -> String {
-    let yellow = c(YELLOW);
-    let reset = c(RESET);
+    resolve_mentions_inner(text, channels, users, c(YELLOW), c(RESET))
+}
+
+// The same resolution without any colouring, for the text that goes into the
+// database: ANSI escapes would be noise in a stored column, but the resolved
+// names are what makes the row readable on its own. Emoji shortcodes and
+// Slack's HTML entities are deliberately left as they arrive — only the
+// references are rewritten.
+fn resolve_mentions_plain(
+    text: &str,
+    channels: &HashMap<String, String>,
+    users: &HashMap<String, String>,
+) -> String {
+    resolve_mentions_inner(text, channels, users, "", "")
+}
+
+fn resolve_mentions_inner(
+    text: &str,
+    channels: &HashMap<String, String>,
+    users: &HashMap<String, String>,
+    yellow: &str,
+    reset: &str,
+) -> String {
     let mut result = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -516,6 +630,25 @@ fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &Hash
         i += ch.len_utf8();
     }
     result
+}
+
+// The mentions table needs the ids themselves, not the rendered names, so this
+// walks the same <@U123> / <@U123|label> syntax as resolve_mentions but keeps
+// the raw id. Deduplicated, because (message_id, user_id) is a primary key and
+// people do get mentioned twice in one message.
+fn extract_mentions(text: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('>') else { break };
+        let id = after[..end].split('|').next().unwrap_or_default();
+        if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    ids
 }
 
 // Slack escapes these three characters in message text (mainly so literal
@@ -743,7 +876,13 @@ fn print_message(
     println!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {text}");
 }
 
-fn handle_event(event: &Value, verbose: bool, channels: &HashMap<String, String>, users: &HashMap<String, String>) {
+fn handle_event(
+    event: &Value,
+    verbose: bool,
+    channels: &HashMap<String, String>,
+    users: &HashMap<String, String>,
+    store: Option<&Store>,
+) {
     let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
 
     match event_type {
@@ -756,6 +895,27 @@ fn handle_event(event: &Value, verbose: bool, channels: &HashMap<String, String>
             // replies — so a live thread shows the same tag on both.
             let thread_ts = event.get("thread_ts").and_then(Value::as_str);
             print_message(ts, channel_id, user_id, text, thread_ts, channels, users);
+
+            if let Some(store) = store {
+                let tag = thread_ts.map(|t| thread_tag(channel_id, t));
+                let stored_text = resolve_mentions_plain(text, channels, users);
+                let row = StoredMessage {
+                    channel_id,
+                    ts,
+                    // "?" is our stand-in for an event with no `user` field, not
+                    // a Slack id — better stored as unknown than as a fake user.
+                    user_id: (user_id != "?").then_some(user_id),
+                    text: &stored_text,
+                    thread_ts,
+                    thread_tag: tag.as_deref(),
+                    // Taken from the raw text, which still has the ids in it.
+                    mentions: extract_mentions(text),
+                };
+                // A failed write must not take the stream down with it.
+                if let Err(e) = store.save_message(&row) {
+                    eprintln!("sqlite write failed for {channel_id}/{ts}: {e}");
+                }
+            }
         }
         "hello" if verbose => println!("(connected — hello received)"),
         "" => {} // no type field (e.g. reply acknowledgements) — ignore
