@@ -23,11 +23,11 @@ pub struct ChannelRow {
     pub kind: &'static str,
 }
 
-// A message about to be written. `text` has its <@U123>/<#C123> references
-// resolved to names but carries no ANSI colouring, and emoji shortcodes and
-// HTML entities are left exactly as Slack sent them: the column should be
-// readable on its own without being a copy of the terminal output. The ids
-// behind the resolved names stay available through the mentions table.
+// A message about to be written. `text` is stored exactly as Slack sent it —
+// <@U123> references, :emoji: shortcodes and HTML entities all intact. Rendering
+// is a lossy view of that: resolving references discards where they were, so a
+// resolved column could not reproduce the terminal output, while the raw one
+// can. Resolved names remain available by joining users through mentions.
 pub struct StoredMessage<'a> {
     pub channel_id: &'a str,
     pub ts: &'a str,
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ts_epoch   REAL    NOT NULL, -- ts as a number, for range queries
     user_id    TEXT             REFERENCES users(id),
     thread_id  INTEGER          REFERENCES threads(id),
-    text       TEXT    NOT NULL,
+    text       TEXT    NOT NULL, -- exactly as Slack sent it
     UNIQUE (channel_id, ts)
 );
 
@@ -146,6 +146,55 @@ impl Store {
         }
         tx.commit()
     }
+
+    // The three loaders below feed the offline mode, which renders straight from
+    // the database and never talks to Slack. They deliberately return the same
+    // shapes the live path builds from the API — id-to-name maps and raw text —
+    // so the renderer can be driven identically from either source.
+    pub fn load_users(&self) -> rusqlite::Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM users")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn load_channels(&self) -> rusqlite::Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM channels")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    // Ordered by ts_epoch, which is chronological across every channel — the
+    // order the messages actually happened in, not the order they were written.
+    // A backfill inserts an older window after newer live messages already
+    // exist, so insertion order would be wrong. ts breaks ties so the output is
+    // stable between runs.
+    pub fn load_messages(&self) -> rusqlite::Result<Vec<LocalMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.ts, m.channel_id, m.user_id, m.text, t.thread_ts
+             FROM messages m
+             LEFT JOIN threads t ON t.id = m.thread_id
+             ORDER BY m.ts_epoch, m.ts",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(LocalMessage {
+                ts: r.get(0)?,
+                channel_id: r.get(1)?,
+                user_id: r.get(2)?,
+                text: r.get(3)?,
+                thread_ts: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+// One stored message, read back for rendering.
+pub struct LocalMessage {
+    pub ts: String,
+    pub channel_id: String,
+    pub user_id: Option<String>,
+    pub text: String,
+    pub thread_ts: Option<String>,
 }
 
 fn insert_message(conn: &Connection, m: &StoredMessage) -> rusqlite::Result<()> {

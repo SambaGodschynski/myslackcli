@@ -14,6 +14,17 @@ use tokio_tungstenite::tungstenite::http::header::COOKIE;
 
 use store::{ChannelRow, Store, StoredMessage};
 
+const USAGE: &str = "\
+usage: myslackcli [options]
+
+  -t, --time <duration>   load history this far back first (e.g. 45s, 30m, 2h, 3d)
+      --sql <file>        record every message in an sqlite file (also --sql=<file>)
+      --local-no-sync     render the --sql file and exit: no Slack calls, no live stream
+      --no-color          plain output without ANSI colours
+  -v, --verbose           report progress while running
+  -h, --help              show this message
+";
+
 const GREEN: &str = "\x1b[32m";
 const BLUE: &str = "\x1b[34m";
 const CYAN: &str = "\x1b[36m";
@@ -62,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut no_color = false;
     let mut backfill_arg: Option<String> = None;
     let mut sql_path: Option<String> = None;
+    let mut local_no_sync = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -76,12 +88,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             other if other.starts_with("--sql=") => {
                 sql_path = Some(other.trim_start_matches("--sql=").to_string());
             }
-            _ => {}
+            "--local-no-sync" => local_no_sync = true,
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            // Silently ignoring these hid typos: a mistyped --sql= meant a run
+            // that looked fine and stored nothing. Printed rather than returned
+            // as an Err because main's error reporting uses Debug formatting,
+            // which would render the usage text with literal escapes.
+            other => {
+                eprintln!("unknown argument: {other}\n");
+                eprint!("{USAGE}");
+                std::process::exit(2);
+            }
         }
     }
     COLOR_ENABLED.set(!no_color).ok();
 
     dotenvy::dotenv().ok(); // fine if there's no .env — vars may already be set in the environment
+
+    // Offline mode renders the database and stops. It runs before the token is
+    // even read: with no request to make, credentials aren't a prerequisite.
+    if local_no_sync {
+        let path = sql_path
+            .as_deref()
+            .ok_or("--local-no-sync reads from the database, so it needs --sql=<file>")?;
+        if !std::path::Path::new(path).exists() {
+            return Err(format!("no such database: {path}").into());
+        }
+        return replay_local(path);
+    }
 
     let token = std::env::var("SLACK_TOKEN").map_err(|_| "SLACK_TOKEN not set (see .env.example)")?;
     let cookie = std::env::var("SLACK_COOKIE").map_err(|_| "SLACK_COOKIE not set (see .env.example)")?;
@@ -208,6 +245,34 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
+// Reproduces the terminal output from the database alone — no Slack calls, no
+// live stream. Because `text` is stored exactly as Slack sent it and the users
+// and channels tables hold the same id-to-name mapping the live run resolved
+// against, this drives the very same print_message and comes out identical to
+// what the message printed when it first arrived.
+fn replay_local(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let store = Store::open(path)?;
+    let users = store.load_users()?;
+    let channels = store.load_channels()?;
+    let messages = store.load_messages()?;
+
+    println!("--- {} stored message(s) from {path} ---", messages.len());
+    for m in &messages {
+        print_message(
+            &m.ts,
+            &m.channel_id,
+            // Mirrors the live path, which prints "?" when an event named no user.
+            m.user_id.as_deref().unwrap_or("?"),
+            &m.text,
+            m.thread_ts.as_deref(),
+            &channels,
+            &users,
+        );
+    }
+    store.close()?;
+    Ok(())
+}
+
 // Backfills via search.messages instead of iterating conversations.history
 // per-channel: a single global, paginated query instead of ~200 individual
 // calls, and — crucially — search indexes thread replies too. (History-per-
@@ -230,8 +295,20 @@ async fn backfill(
         .ok_or("duration too large")?
         .as_secs_f64();
 
-    let mut all_messages = search_messages_since(client, token, cookie, oldest, label).await?;
+    // A failure part-way through — a rate limit is the likely one — must not
+    // discard the pages that already came back. The search appends into this Vec
+    // as it goes, so whatever arrived before the error is still here, and the
+    // run carries on with it: print it, store it, then go live. Aborting would
+    // throw away real work over a transient API error.
+    let mut all_messages = Vec::new();
+    let outcome = search_messages_since(client, token, cookie, oldest, label, &mut all_messages).await;
     eprintln!(); // finish the progress line
+    if let Err(e) = outcome {
+        eprintln!(
+            "History load stopped early ({e}) — continuing with the {} message(s) already fetched.",
+            all_messages.len()
+        );
+    }
 
     all_messages.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
     tag_thread_parents(&mut all_messages);
@@ -250,31 +327,30 @@ async fn backfill(
     }
 
     if let Some(store) = store {
-        // Both the tags and the resolved texts have to outlive the borrows held
-        // by StoredMessage, so they're materialised before the rows are built.
+        // thread_tag() results have to outlive the borrows held by StoredMessage,
+        // so they're materialised before the rows are built.
         let tags: Vec<Option<String>> = all_messages
             .iter()
             .map(|m| m.thread_ts.as_deref().map(|t| thread_tag(&m.channel_id, t)))
             .collect();
-        let texts: Vec<String> = all_messages
-            .iter()
-            .map(|m| resolve_mentions_plain(&m.text, channels, users))
-            .collect();
         let rows: Vec<StoredMessage> = all_messages
             .iter()
-            .enumerate()
-            .map(|(i, m)| StoredMessage {
+            .zip(&tags)
+            .map(|(m, tag)| StoredMessage {
                 channel_id: &m.channel_id,
                 ts: &m.ts_raw,
                 user_id: Some(m.user_id.as_str()),
-                text: &texts[i],
+                text: &m.text,
                 thread_ts: m.thread_ts.as_deref(),
-                thread_tag: tags[i].as_deref(),
-                // Taken from the raw text, which still has the ids in it.
+                thread_tag: tag.as_deref(),
                 mentions: extract_mentions(&m.text),
             })
             .collect();
-        store.save_batch(&rows)?;
+        // Same reasoning as above: report and carry on into live mode rather
+        // than exiting and losing the session over one failed write.
+        if let Err(e) = store.save_batch(&rows) {
+            eprintln!("Storing the history failed: {e}");
+        }
     }
     Ok(())
 }
@@ -313,15 +389,15 @@ async fn search_messages_since(
     cookie: &str,
     oldest: f64,
     label: &str,
-) -> Result<Vec<HistMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    out: &mut Vec<HistMessage>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let oldest_dt = Local.timestamp_opt(oldest as i64, 0).single().ok_or("bad oldest timestamp")?;
     let after_date = (oldest_dt - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
     let query = format!("after:{after_date}");
 
-    let mut messages = Vec::new();
     let mut page = 1u32;
     loop {
-        eprint!("\rSearching history since {label}: page {page}, {} message(s) so far...", messages.len());
+        eprint!("\rSearching history since {label}: page {page}, {} message(s) so far...", out.len());
         std::io::stderr().flush().ok();
 
         let url = format!(
@@ -357,7 +433,7 @@ async fn search_messages_since(
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or_else(|| item.get("permalink").and_then(Value::as_str).and_then(thread_ts_from_permalink));
-            messages.push(HistMessage {
+            out.push(HistMessage {
                 ts,
                 ts_raw: ts_str.to_string(),
                 channel_id: channel_id.to_string(),
@@ -379,29 +455,70 @@ async fn search_messages_since(
         page += 1;
     }
 
-    Ok(messages)
+    Ok(())
 }
 
+// How often a single request is allowed to wait out a rate limit before giving
+// up. Bounded so a limit that isn't clearing can't stall the run indefinitely —
+// once exhausted the error propagates, and the backfill keeps whatever it has.
+const MAX_RATE_LIMIT_WAITS: u32 = 5;
+// Used when a rate limit arrives without a Retry-After we can read.
+const FALLBACK_RETRY_AFTER: u64 = 5;
+// Slack's suggested wait is honoured, but not blindly: a very long value would
+// look like a hang. Capping just means the next attempt may be limited again,
+// which the retry budget already accounts for.
+const MAX_RETRY_AFTER: u64 = 60;
+
+// Every Slack call goes through here, so this is also where rate limiting is
+// handled. A 429 isn't a real failure: the request is well-formed and succeeds
+// once the per-method window rolls over, so waiting the stated time and retrying
+// is what actually finishes a large backfill.
 async fn slack_get(
     client: &reqwest::Client,
     token: &str,
     cookie: &str,
     url: &str,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let resp: Value = client
-        .get(url)
-        .bearer_auth(token)
-        .header(reqwest::header::COOKIE, format!("d={cookie}"))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let mut waits = 0u32;
+    loop {
+        let response = client
+            .get(url)
+            .bearer_auth(token)
+            .header(reqwest::header::COOKIE, format!("d={cookie}"))
+            .send()
+            .await?;
 
-    if resp.get("ok").and_then(Value::as_bool) != Some(true) {
-        let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
-        return Err(format!("Slack API error: {err}").into());
+        // Read both before `json()` consumes the response. On a 429 the body
+        // isn't necessarily JSON, so the status has to be checked first.
+        let http_rate_limited = response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        if !http_rate_limited {
+            let resp: Value = response.json().await?;
+            if resp.get("ok").and_then(Value::as_bool) == Some(true) {
+                return Ok(resp);
+            }
+            let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
+            // Slack reports the limit in the body on some paths rather than as a
+            // 429, so that spelling has to be treated the same way.
+            if err != "ratelimited" {
+                return Err(format!("Slack API error: {err}").into());
+            }
+        }
+
+        waits += 1;
+        if waits > MAX_RATE_LIMIT_WAITS {
+            return Err(format!("Slack API error: ratelimited (gave up after {MAX_RATE_LIMIT_WAITS} waits)").into());
+        }
+        let secs = retry_after.unwrap_or(FALLBACK_RETRY_AFTER).clamp(1, MAX_RETRY_AFTER);
+        // Leading newline so this doesn't land on top of the progress line.
+        eprintln!("\nRate limited by Slack — waiting {secs}s ({waits}/{MAX_RATE_LIMIT_WAITS})...");
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     }
-    Ok(resp)
 }
 
 fn next_cursor(resp: &Value) -> Option<String> {
@@ -574,29 +691,8 @@ fn thread_ts_from_permalink(permalink: &str) -> Option<String> {
 // #foo (or the resolved channel name), <!here>/<!channel>/<!everyone> ->
 // @here/@channel/@everyone. Links (<https://...|label>) are left untouched.
 fn resolve_mentions(text: &str, channels: &HashMap<String, String>, users: &HashMap<String, String>) -> String {
-    resolve_mentions_inner(text, channels, users, c(YELLOW), c(RESET))
-}
-
-// The same resolution without any colouring, for the text that goes into the
-// database: ANSI escapes would be noise in a stored column, but the resolved
-// names are what makes the row readable on its own. Emoji shortcodes and
-// Slack's HTML entities are deliberately left as they arrive — only the
-// references are rewritten.
-fn resolve_mentions_plain(
-    text: &str,
-    channels: &HashMap<String, String>,
-    users: &HashMap<String, String>,
-) -> String {
-    resolve_mentions_inner(text, channels, users, "", "")
-}
-
-fn resolve_mentions_inner(
-    text: &str,
-    channels: &HashMap<String, String>,
-    users: &HashMap<String, String>,
-    yellow: &str,
-    reset: &str,
-) -> String {
+    let yellow = c(YELLOW);
+    let reset = c(RESET);
     let mut result = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -898,17 +994,15 @@ fn handle_event(
 
             if let Some(store) = store {
                 let tag = thread_ts.map(|t| thread_tag(channel_id, t));
-                let stored_text = resolve_mentions_plain(text, channels, users);
                 let row = StoredMessage {
                     channel_id,
                     ts,
                     // "?" is our stand-in for an event with no `user` field, not
                     // a Slack id — better stored as unknown than as a fake user.
                     user_id: (user_id != "?").then_some(user_id),
-                    text: &stored_text,
+                    text,
                     thread_ts,
                     thread_tag: tag.as_deref(),
-                    // Taken from the raw text, which still has the ids in it.
                     mentions: extract_mentions(text),
                 };
                 // A failed write must not take the stream down with it.
@@ -921,5 +1015,99 @@ fn handle_event(
         "" => {} // no type field (e.g. reply acknowledgements) — ignore
         other if verbose => println!("({other} event)"),
         _ => {} // non-verbose: only "message" events get printed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn rate_limited() -> String {
+        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()
+    }
+
+    fn ok_body() -> String {
+        let json = r#"{"ok":true,"value":42}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+            json.len()
+        )
+    }
+
+    // Answers each connection with the next canned response, so a test can lay
+    // out the exact sequence a caller should survive.
+    async fn serve(responses: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for body in responses {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await; // consume the request first
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}/api/test")
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_is_waited_out_rather_than_returned_as_an_error() {
+        let url = serve(vec![rate_limited(), ok_body()]).await;
+        let started = std::time::Instant::now();
+
+        let resp = slack_get(&reqwest::Client::new(), "token", "cookie", &url)
+            .await
+            .expect("should succeed on the retry");
+
+        assert_eq!(resp.get("value").and_then(Value::as_i64), Some(42));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "Retry-After: 1 should have been honoured, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The body-level spelling: HTTP 200 with {"ok":false,"error":"ratelimited"}.
+    #[tokio::test]
+    async fn a_rate_limit_reported_in_the_body_is_treated_the_same() {
+        let json = r#"{"ok":false,"error":"ratelimited"}"#;
+        let limited = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+            json.len()
+        );
+        let url = serve(vec![limited, ok_body()]).await;
+
+        let resp = slack_get(&reqwest::Client::new(), "token", "cookie", &url).await.unwrap();
+        assert_eq!(resp.get("value").and_then(Value::as_i64), Some(42));
+    }
+
+    #[tokio::test]
+    async fn the_retry_budget_is_bounded_so_a_persistent_limit_cannot_hang_the_run() {
+        // One more 429 than the budget allows.
+        let responses = vec![rate_limited(); MAX_RATE_LIMIT_WAITS as usize + 1];
+        let url = serve(responses).await;
+
+        let err = slack_get(&reqwest::Client::new(), "token", "cookie", &url)
+            .await
+            .expect_err("should give up instead of looping forever");
+        assert!(err.to_string().contains("ratelimited"), "got: {err}");
+    }
+
+    // A genuine API error must not be retried — only rate limits are transient.
+    #[tokio::test]
+    async fn other_api_errors_fail_immediately() {
+        let json = r#"{"ok":false,"error":"invalid_auth"}"#;
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+            json.len()
+        );
+        let url = serve(vec![body]).await;
+
+        let err = slack_get(&reqwest::Client::new(), "token", "cookie", &url)
+            .await
+            .expect_err("invalid_auth is not retryable");
+        assert!(err.to_string().contains("invalid_auth"), "got: {err}");
     }
 }
