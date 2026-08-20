@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 // Persistence is opt-in via --sql=<file>; nothing in here runs otherwise.
 //
@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (channel_id, ts)
 );
 
+-- Workspace-level facts needed to build links, fetched once per database:
+-- the team id for slack:// deep links and the domain for web permalinks.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS mentions (
     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     user_id    TEXT    NOT NULL REFERENCES users(id),
@@ -131,20 +138,41 @@ impl Store {
         self.conn.close().map_err(|(_, e)| e)
     }
 
-    pub fn save_message(&self, m: &StoredMessage) -> rusqlite::Result<()> {
+    pub fn get_meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // Returns the row id, which the caller prints as the first column so a
+    // selected line can be turned back into a link.
+    pub fn save_message(&self, m: &StoredMessage) -> rusqlite::Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
-        insert_message(&tx, m)?;
-        tx.commit()
+        let id = insert_message(&tx, m)?;
+        tx.commit()?;
+        Ok(id)
     }
 
     // Backfill inserts the whole window at once; a single commit for the batch
     // rather than one per message is the difference between seconds and minutes.
-    pub fn save_batch(&self, msgs: &[StoredMessage]) -> rusqlite::Result<()> {
+    // Ids come back in the same order as `msgs`.
+    pub fn save_batch(&self, msgs: &[StoredMessage]) -> rusqlite::Result<Vec<i64>> {
         let tx = self.conn.unchecked_transaction()?;
+        let mut ids = Vec::with_capacity(msgs.len());
         for m in msgs {
-            insert_message(&tx, m)?;
+            ids.push(insert_message(&tx, m)?);
         }
-        tx.commit()
+        tx.commit()?;
+        Ok(ids)
     }
 
     // The three loaders below feed the offline mode, which renders straight from
@@ -170,26 +198,57 @@ impl Store {
     // stable between runs.
     pub fn load_messages(&self) -> rusqlite::Result<Vec<LocalMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.ts, m.channel_id, m.user_id, m.text, t.thread_ts
+            "SELECT m.id, m.ts, m.channel_id, m.user_id, m.text, t.thread_ts
              FROM messages m
              LEFT JOIN threads t ON t.id = m.thread_id
              ORDER BY m.ts_epoch, m.ts",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(LocalMessage {
-                ts: r.get(0)?,
-                channel_id: r.get(1)?,
-                user_id: r.get(2)?,
-                text: r.get(3)?,
-                thread_ts: r.get(4)?,
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                channel_id: r.get(2)?,
+                user_id: r.get(3)?,
+                text: r.get(4)?,
+                thread_ts: r.get(5)?,
             })
         })?;
         rows.collect()
     }
+
+    // Looks up the one message a link is being built for. Returns None when the
+    // id doesn't exist, which the caller reports rather than treating as empty.
+    pub fn message_by_id(&self, id: i64) -> rusqlite::Result<Option<MessageRef>> {
+        self.conn
+            .query_row(
+                "SELECT m.channel_id, m.ts, t.thread_ts
+                 FROM messages m
+                 LEFT JOIN threads t ON t.id = m.thread_id
+                 WHERE m.id = ?1",
+                params![id],
+                |r| {
+                    Ok(MessageRef {
+                        channel_id: r.get(0)?,
+                        ts: r.get(1)?,
+                        thread_ts: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+    }
+}
+
+// Just enough of a message to address it: which conversation, which timestamp,
+// and the thread it belongs to if any.
+pub struct MessageRef {
+    pub channel_id: String,
+    pub ts: String,
+    pub thread_ts: Option<String>,
 }
 
 // One stored message, read back for rendering.
 pub struct LocalMessage {
+    pub id: i64,
     pub ts: String,
     pub channel_id: String,
     pub user_id: Option<String>,
@@ -197,7 +256,7 @@ pub struct LocalMessage {
     pub thread_ts: Option<String>,
 }
 
-fn insert_message(conn: &Connection, m: &StoredMessage) -> rusqlite::Result<()> {
+fn insert_message(conn: &Connection, m: &StoredMessage) -> rusqlite::Result<i64> {
     // A message can name a channel or user that wasn't in the startup listing —
     // a channel created since, or an id we couldn't resolve. A placeholder row
     // keeps the foreign keys satisfied instead of dropping the message.
@@ -253,7 +312,7 @@ fn insert_message(conn: &Connection, m: &StoredMessage) -> rusqlite::Result<()> 
             params![message_id, user_id],
         )?;
     }
-    Ok(())
+    Ok(message_id)
 }
 
 // Names come from sync_users; this only guarantees the row exists, so it must

@@ -12,7 +12,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::COOKIE;
 
-use store::{ChannelRow, Store, StoredMessage};
+use store::{ChannelRow, MessageRef, Store, StoredMessage};
 
 const USAGE: &str = "\
 usage: myslackcli [options]
@@ -20,6 +20,10 @@ usage: myslackcli [options]
   -t, --time <duration>   load history this far back first (e.g. 45s, 30m, 2h, 3d)
       --sql <file>        record every message in an sqlite file (also --sql=<file>)
       --local-no-sync     render the --sql file and exit: no Slack calls, no live stream
+      --to-app-url=<id>   print the slack:// deep link for a message id and exit
+      --to-web-url=<id>   print the https:// permalink for a message id and exit
+      --env <file>        read SLACK_TOKEN/SLACK_COOKIE from this file
+                          (default: .env, resolved from the working directory)
       --no-color          plain output without ANSI colours
   -v, --verbose           report progress while running
   -h, --help              show this message
@@ -74,6 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut backfill_arg: Option<String> = None;
     let mut sql_path: Option<String> = None;
     let mut local_no_sync = false;
+    let mut env_path: Option<String> = None;
+    // (message id, web form?) — the two link flags differ only in the spelling.
+    let mut link_for: Option<(String, bool)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -89,6 +96,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 sql_path = Some(other.trim_start_matches("--sql=").to_string());
             }
             "--local-no-sync" => local_no_sync = true,
+            "--env" => {
+                env_path = Some(args.next().ok_or("missing value for --env (e.g. --env=/path/.env)")?);
+            }
+            other if other.starts_with("--env=") => {
+                env_path = Some(other.trim_start_matches("--env=").to_string());
+            }
+            "--to-app-url" | "--to-web-url" => {
+                let web = a == "--to-web-url";
+                let id = args.next().ok_or_else(|| format!("missing message id for {a}"))?;
+                link_for = Some((id, web));
+            }
+            other if other.starts_with("--to-app-url=") || other.starts_with("--to-web-url=") => {
+                let (flag, id) = other.split_once('=').expect("checked by the guard");
+                link_for = Some((id.to_string(), flag == "--to-web-url"));
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(());
@@ -106,10 +128,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     COLOR_ENABLED.set(!no_color).ok();
 
-    dotenvy::dotenv().ok(); // fine if there's no .env — vars may already be set in the environment
+    match &env_path {
+        // Named explicitly, so a path that doesn't load is an error rather than
+        // something to shrug off — the alternative is failing later with a
+        // confusing "SLACK_TOKEN not set".
+        Some(path) => dotenvy::from_path(path).map_err(|e| format!("could not read {path}: {e}"))?,
+        // Resolved from the working directory, which is why --env exists: the
+        // credentials live next to the project, and callers don't always run
+        // from there. Absent is fine — the vars may already be in the
+        // environment, and the offline modes need neither.
+        None => {
+            dotenvy::dotenv().ok();
+        }
+    }
 
-    // Offline mode renders the database and stops. It runs before the token is
+    // Both of these read the database and stop, so they run before the token is
     // even read: with no request to make, credentials aren't a prerequisite.
+    if let Some((id, web)) = &link_for {
+        let path = sql_path
+            .as_deref()
+            .ok_or("--to-app-url/--to-web-url look the message up in the database, so they need --sql=<file>")?;
+        let id: i64 = id.parse().map_err(|_| format!("message id must be a number, got {id:?}"))?;
+        return print_link(path, id, *web);
+    }
+
+    // Offline mode renders the database and stops.
     if local_no_sync {
         let path = sql_path
             .as_deref()
@@ -142,6 +185,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let store = Store::open(path)?;
             store.sync_users(&users)?;
             store.sync_channels(&channel_rows)?;
+            // Deliberately not fatal: these two values only power the link
+            // flags, so failing to fetch them costs a convenience, not the run.
+            // Aborting here meant a rate-limited auth.test threw away the whole
+            // session — and behind fzf the error wasn't even visible, since the
+            // pager repaints over stderr.
+            if let Err(e) = ensure_workspace_meta(&client, &token, &cookie, &store).await {
+                eprintln!("could not record workspace details ({e}) — link flags stay unavailable");
+            }
             if verbose {
                 println!("Storing messages in {path}");
             }
@@ -245,6 +296,77 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
+// The team id and the workspace domain are what turn a stored message into a
+// link, and neither ever changes — so they're fetched once and kept in the
+// database. That's what lets --to-app-url work offline later, straight from the
+// file, and it costs one extra request per database rather than per run.
+async fn ensure_workspace_meta(
+    client: &reqwest::Client,
+    token: &str,
+    cookie: &str,
+    store: &Store,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if store.get_meta("team_id")?.is_some() && store.get_meta("workspace_domain")?.is_some() {
+        return Ok(());
+    }
+    let resp = slack_get(client, token, cookie, "https://slack.com/api/auth.test").await?;
+    if let Some(team_id) = resp.get("team_id").and_then(Value::as_str) {
+        store.set_meta("team_id", team_id)?;
+    }
+    // auth.test reports the full workspace URL; the permalink wants just the host.
+    if let Some(url) = resp.get("url").and_then(Value::as_str) {
+        let domain = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        store.set_meta("workspace_domain", domain)?;
+    }
+    Ok(())
+}
+
+// Resolves one stored message to a link and prints it. Printing rather than
+// opening keeps the caller free to do either — pipe it to xdg-open, or to a
+// clipboard — without this needing to know which.
+fn print_link(path: &str, id: i64, web: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !std::path::Path::new(path).exists() {
+        return Err(format!("no such database: {path}").into());
+    }
+    let store = Store::open(path)?;
+    let message = store
+        .message_by_id(id)?
+        .ok_or_else(|| format!("no message with id {id} in {path}"))?;
+
+    let key = if web { "workspace_domain" } else { "team_id" };
+    let value = store.get_meta(key)?.ok_or_else(|| {
+        format!("{key} isn't recorded in {path} yet — run once with --sql (online) so it can be fetched")
+    })?;
+
+    println!("{}", if web { web_url(&value, &message) } else { app_url(&value, &message) });
+    store.close()?;
+    Ok(())
+}
+
+// Slack addresses a message by conversation plus its raw ts; the two link forms
+// only differ in how they spell that. The deep link keeps the dotted ts and
+// needs the team id, the permalink drops the dot behind a "p" and needs the
+// domain. Both take the thread parent when there is one — without it a reply
+// opens the channel rather than the thread it belongs to.
+fn app_url(team_id: &str, m: &MessageRef) -> String {
+    let mut url = format!("slack://channel?team={team_id}&id={}&message={}", m.channel_id, m.ts);
+    if let Some(parent) = &m.thread_ts {
+        url += &format!("&thread_ts={parent}");
+    }
+    url
+}
+
+fn web_url(domain: &str, m: &MessageRef) -> String {
+    let mut url = format!("https://{domain}/archives/{}/p{}", m.channel_id, m.ts.replace('.', ""));
+    if let Some(parent) = &m.thread_ts {
+        url += &format!("?thread_ts={parent}&cid={}", m.channel_id);
+    }
+    url
+}
+
 // Reproduces the terminal output from the database alone — no Slack calls, no
 // live stream. Because `text` is stored exactly as Slack sent it and the users
 // and channels tables hold the same id-to-name mapping the live run resolved
@@ -259,6 +381,7 @@ fn replay_local(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Syn
     println!("--- {} stored message(s) from {path} ---", messages.len());
     for m in &messages {
         print_message(
+            Some(m.id),
             &m.ts,
             &m.channel_id,
             // Mirrors the live path, which prints "?" when an event named no user.
@@ -313,9 +436,48 @@ async fn backfill(
     all_messages.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
     tag_thread_parents(&mut all_messages);
 
+    // Stored before printing, because the row ids are the first column and only
+    // the insert can tell us what they are. Without --sql there are none, and the
+    // lines print unprefixed.
+    let ids: Vec<Option<i64>> = match store {
+        Some(store) => {
+            // thread_tag() results have to outlive the borrows held by
+            // StoredMessage, so they're materialised before the rows are built.
+            let tags: Vec<Option<String>> = all_messages
+                .iter()
+                .map(|m| m.thread_ts.as_deref().map(|t| thread_tag(&m.channel_id, t)))
+                .collect();
+            let rows: Vec<StoredMessage> = all_messages
+                .iter()
+                .zip(&tags)
+                .map(|(m, tag)| StoredMessage {
+                    channel_id: &m.channel_id,
+                    ts: &m.ts_raw,
+                    user_id: Some(m.user_id.as_str()),
+                    text: &m.text,
+                    thread_ts: m.thread_ts.as_deref(),
+                    thread_tag: tag.as_deref(),
+                    mentions: extract_mentions(&m.text),
+                })
+                .collect();
+            // Same reasoning as above: report and carry on into live mode rather
+            // than exiting and losing the session over one failed write. The
+            // history still prints, just without ids to link back to.
+            match store.save_batch(&rows) {
+                Ok(ids) => ids.into_iter().map(Some).collect(),
+                Err(e) => {
+                    eprintln!("Storing the history failed: {e}");
+                    vec![None; all_messages.len()]
+                }
+            }
+        }
+        None => vec![None; all_messages.len()],
+    };
+
     println!("--- {} historical message(s) since {label} ---", all_messages.len());
-    for m in &all_messages {
+    for (m, id) in all_messages.iter().zip(&ids) {
         print_message(
+            *id,
             &m.ts_raw,
             &m.channel_id,
             &m.user_id,
@@ -324,33 +486,6 @@ async fn backfill(
             channels,
             users,
         );
-    }
-
-    if let Some(store) = store {
-        // thread_tag() results have to outlive the borrows held by StoredMessage,
-        // so they're materialised before the rows are built.
-        let tags: Vec<Option<String>> = all_messages
-            .iter()
-            .map(|m| m.thread_ts.as_deref().map(|t| thread_tag(&m.channel_id, t)))
-            .collect();
-        let rows: Vec<StoredMessage> = all_messages
-            .iter()
-            .zip(&tags)
-            .map(|(m, tag)| StoredMessage {
-                channel_id: &m.channel_id,
-                ts: &m.ts_raw,
-                user_id: Some(m.user_id.as_str()),
-                text: &m.text,
-                thread_ts: m.thread_ts.as_deref(),
-                thread_tag: tag.as_deref(),
-                mentions: extract_mentions(&m.text),
-            })
-            .collect();
-        // Same reasoning as above: report and carry on into live mode rather
-        // than exiting and losing the session over one failed write.
-        if let Err(e) = store.save_batch(&rows) {
-            eprintln!("Storing the history failed: {e}");
-        }
     }
     Ok(())
 }
@@ -950,6 +1085,11 @@ fn emoji_for(name: &str) -> Option<&'static str> {
 }
 
 fn print_message(
+    // The database row id, when there is one. Printed first so a line selected
+    // in a pager can be turned back into a message — nothing else in the output
+    // identifies it: the channel appears by name, not id, and the timestamp is
+    // shown to the second while Slack addresses messages to the microsecond.
+    id: Option<i64>,
     ts: &str,
     channel_id: &str,
     user_id: &str,
@@ -969,7 +1109,15 @@ fn print_message(
         Some(t) => format!(" {magenta}[t:{}]{reset}", thread_tag(channel_id, t)),
         None => String::new(),
     };
-    println!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {text}");
+    let line = format!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {text}");
+    match id {
+        // A message can span several lines, and a pager treats each of them as
+        // its own entry — so every line carries the id, not just the first.
+        // Otherwise selecting a continuation line resolves against whatever its
+        // first word happens to be.
+        Some(id) => line.split('\n').for_each(|l| println!("{id} {l}")),
+        None => println!("{line}"),
+    }
 }
 
 fn handle_event(
@@ -990,8 +1138,10 @@ fn handle_event(
             // Present on every reply, and on the parent itself once it has
             // replies — so a live thread shows the same tag on both.
             let thread_ts = event.get("thread_ts").and_then(Value::as_str);
-            print_message(ts, channel_id, user_id, text, thread_ts, channels, users);
 
+            // Stored before printing, because the row id is the first column and
+            // only the insert can tell us what it is.
+            let mut id = None;
             if let Some(store) = store {
                 let tag = thread_ts.map(|t| thread_tag(channel_id, t));
                 let row = StoredMessage {
@@ -1005,11 +1155,14 @@ fn handle_event(
                     thread_tag: tag.as_deref(),
                     mentions: extract_mentions(text),
                 };
-                // A failed write must not take the stream down with it.
-                if let Err(e) = store.save_message(&row) {
-                    eprintln!("sqlite write failed for {channel_id}/{ts}: {e}");
+                // A failed write must not take the stream down with it — the
+                // message still prints, just without an id to link back to.
+                match store.save_message(&row) {
+                    Ok(row_id) => id = Some(row_id),
+                    Err(e) => eprintln!("sqlite write failed for {channel_id}/{ts}: {e}"),
                 }
             }
+            print_message(id, ts, channel_id, user_id, text, thread_ts, channels, users);
         }
         "hello" if verbose => println!("(connected — hello received)"),
         "" => {} // no type field (e.g. reply acknowledgements) — ignore
