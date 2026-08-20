@@ -9,11 +9,17 @@ it for anything important.
 
 ## Setup
 
+Credentials live outside the checkout, so they can't be committed by accident:
+
 ```bash
-cp .env.example .env
+mkdir -p ~/.config/myslackcli
+cp .env.example ~/.config/myslackcli/.env
+chmod 600 ~/.config/myslackcli/.env
 # fill in SLACK_TOKEN and SLACK_COOKIE below
 cargo run
 ```
+
+`--env <file>` points at a different file if you'd rather keep it elsewhere.
 
 ## Getting a token & cookie
 
@@ -27,8 +33,8 @@ cargo run
    find the cookie named **`d`** → copy its value. That's your
    `SLACK_COOKIE` (starts with `xoxd-`).
 
-Both are full session credentials for your own account — don't share them,
-don't commit `.env` (it's gitignored already).
+Both are full session credentials for your own account — don't share them, and
+keep the file out of the checkout (see Setup).
 
 ## Usage
 

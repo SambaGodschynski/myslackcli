@@ -23,7 +23,7 @@ usage: myslackcli [options]
       --to-app-url=<id>   print the slack:// deep link for a message id and exit
       --to-web-url=<id>   print the https:// permalink for a message id and exit
       --env <file>        read SLACK_TOKEN/SLACK_COOKIE from this file
-                          (default: .env, resolved from the working directory)
+                          (default: ~/.config/myslackcli/.env)
       --no-color          plain output without ANSI colours
   -v, --verbose           report progress while running
   -h, --help              show this message
@@ -133,12 +133,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // something to shrug off — the alternative is failing later with a
         // confusing "SLACK_TOKEN not set".
         Some(path) => dotenvy::from_path(path).map_err(|e| format!("could not read {path}: {e}"))?,
-        // Resolved from the working directory, which is why --env exists: the
-        // credentials live next to the project, and callers don't always run
-        // from there. Absent is fine — the vars may already be in the
-        // environment, and the offline modes need neither.
+        // Deliberately not the working directory: these are full session
+        // credentials for the account, and a file that sits next to the source
+        // is one stray `git add -f` away from being published. Absent is fine —
+        // the vars may already be in the environment, and the offline modes need
+        // neither.
         None => {
-            dotenvy::dotenv().ok();
+            if let Some(path) = default_env_path() {
+                dotenvy::from_path(path).ok();
+            }
         }
     }
 
@@ -163,8 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return replay_local(path);
     }
 
-    let token = std::env::var("SLACK_TOKEN").map_err(|_| "SLACK_TOKEN not set (see .env.example)")?;
-    let cookie = std::env::var("SLACK_COOKIE").map_err(|_| "SLACK_COOKIE not set (see .env.example)")?;
+    let token = std::env::var("SLACK_TOKEN").map_err(|_| "SLACK_TOKEN not set — put it in ~/.config/myslackcli/.env (see .env.example)")?;
+    let cookie = std::env::var("SLACK_COOKIE").map_err(|_| "SLACK_COOKIE not set — put it in ~/.config/myslackcli/.env (see .env.example)")?;
 
     let client = reqwest::Client::new();
 
@@ -271,6 +274,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+// $XDG_CONFIG_HOME/myslackcli/.env, falling back to ~/.config/myslackcli/.env.
+// Override with --env.
+fn default_env_path() -> Option<std::path::PathBuf> {
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(config_home.join("myslackcli").join(".env"))
 }
 
 // Parses "1h", "30m", "2d", "45s" (bare numbers are treated as seconds).
