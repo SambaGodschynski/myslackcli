@@ -37,10 +37,78 @@ don't commit `.env` (it's gitignored already).
 ./myslackcli -t 1h            # also backfill the last hour first, then go live
 ./myslackcli -v               # show connection/lifecycle chatter too
 ./myslackcli --no-color       # plain text, no ANSI colors
+./myslackcli --help           # all flags
 ```
 
-Pipes nicely into a pager or fuzzy-finder:
+Messages that belong to a thread carry a short id like `[t:9x4t]` — the same one
+on every message of that thread, so filtering on `t:9x4t` pulls the whole
+conversation out of the stream.
+
+Pipes nicely into a fuzzy-finder:
 ```bash
-./myslackcli | less -RF       # -R for colors, -F to follow like tail -f
-./myslackcli | fzf --no-sort --tac --ansi # fuzzy-search the live stream
+./myslackcli | fzf --no-sort --tac --ansi
 ```
+
+## Recording to sqlite
+
+`--sql=<file>` stores every message, live and backfilled, in a sqlite file.
+`--local-no-sync` then reads that file instead of the server.
+
+```bash
+./myslackcli -t 3d --sql=slack.db            # stream and record
+./myslackcli --sql=slack.db --local-no-sync   # read the file instead of the server
+```
+
+## Jumping back into Slack
+
+With `--sql`, every line starts with the message's database id:
+
+```
+4711 [18.08.26 10:22:32] [#general] [t:9x4t] Ada Lovelace: see the thread
+```
+
+Hand that id back and you get a link to the message — a reply links into its
+thread, not just the channel:
+
+```bash
+./myslackcli --sql=slack.db --to-app-url=4711   # slack://…  opens the desktop app
+./myslackcli --sql=slack.db --to-web-url=4711   # https://…  permalink for sharing
+```
+
+Both only read the database. The workspace details they need are fetched on the
+first run with `--sql` and kept in the file, so the links work offline after
+that.
+
+## fzf integration
+
+Putting those pieces together: a fuzzy-searchable Slack where Enter opens the
+selected message in the desktop app and Ctrl-Y copies its permalink.
+
+```bash
+X_SLACK_BIN=/path/to/myslackcli/target/release/myslackcli
+X_SLACK_DB=~/slack/db.sqlite
+
+x_slack_fzf()
+{
+  fzf --no-sort --tac --ansi --wrap=word --style minimal \
+      --with-nth=2.. \
+      --bind "enter:execute-silent(xdg-open \"\$($X_SLACK_BIN --sql $X_SLACK_DB --to-app-url={1})\")" \
+      --bind "ctrl-y:execute-silent($X_SLACK_BIN --sql $X_SLACK_DB --to-web-url={1} | xclip -selection clipboard)"
+}
+
+# last 2h of history, then keep streaming live
+x_slack()         { $X_SLACK_BIN -t "${1:-2h}" --sql $X_SLACK_DB | x_slack_fzf; }
+
+# everything ever recorded, straight from the database
+x_slack_history() { $X_SLACK_BIN --sql $X_SLACK_DB --local-no-sync | x_slack_fzf; }
+```
+
+Two details in there are easy to get wrong:
+
+- **`--with-nth=2..`** hides the id column from the list *and* from the search,
+  so the ids don't pollute your queries. `{1}` still resolves against the
+  original line, so the bindings can use the id you can't see.
+- **`execute-silent`, not `become`.** `become` *replaces* the fzf process, so
+  the session would end the moment you open the first message. The tradeoff is
+  that Enter no longer accepts, so fzf prints nothing on stdout — bind a third
+  key to `accept` if you want that.
