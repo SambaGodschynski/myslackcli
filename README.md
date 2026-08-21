@@ -50,6 +50,21 @@ Messages that belong to a thread carry a short id like `[t:9x4t]` — the same o
 on every message of that thread, so filtering on `t:9x4t` pulls the whole
 conversation out of the stream.
 
+Not every message is text. Slack leaves `text` empty for uploads, huddles and
+link unfurls and puts the substance in a field of its own, so those lines used
+to show nothing but a name and a colon. They now say what they are:
+
+```
+[18.08.26 15:02:43] [#general] Ada Lovelace: [Upload: diagram.png +2] have a look
+[18.08.26 15:10:11] [#general] Ada Lovelace: [Anruf: Ada, Grace, Alan — 17m]
+[18.08.26 15:11:02] [#general] Grace Hopper: [Link: Improbable Research #129]
+```
+
+A bot post names itself instead of carrying a user id, so it's attributed to the
+bot rather than to `?`, and integrations that post Block Kit (Jira, Confluence)
+get their text reassembled from the blocks. Reactions appear live as
+`[Reaktion] 👍`; they aren't messages, so they aren't recorded.
+
 Pipes nicely into a fuzzy-finder:
 ```bash
 ./myslackcli | fzf --no-sort --tac --ansi
@@ -64,6 +79,27 @@ Pipes nicely into a fuzzy-finder:
 ./myslackcli -t 3d --sql=slack.db            # stream and record
 ./myslackcli --sql=slack.db --local-no-sync   # read the file instead of the server
 ```
+
+## Loading older history
+
+`-t` counts back from now, so reaching further means re-fetching everything you
+already have. `--before` moves the newer edge of the window instead, which is
+how you pull in older chunks:
+
+```bash
+./myslackcli --before=2026-05-13 -t 100d --sql=slack.db   # days 100–200
+./myslackcli --before=2026-02-02 -t 100d --sql=slack.db   # days 200–300
+```
+
+The date is that newer edge, and it's exclusive — local midnight of the day you
+name. So using one chunk's oldest day as the next `--before` neither overlaps
+nor leaves a gap. A `--before` run also exits once the window is loaded instead
+of dropping into the live stream, so chunks can be chained in a script.
+
+Re-reading a window you already had was never a correctness problem — a message
+is uniquely (channel, ts) and every write is an upsert, so nothing was ever
+stored twice. It cost requests, and a wide window is exactly where Slack's rate
+limit bites.
 
 ## Jumping back into Slack
 

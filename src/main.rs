@@ -19,6 +19,9 @@ usage: myslackcli [options]
 
   -t, --time <duration>   load history this far back first (e.g. 45s, 30m, 2h, 3d)
       --sql <file>        record every message in an sqlite file (also --sql=<file>)
+      --before <date>     load the -t window ending at this date (YYYY-MM-DD)
+                          instead of at now, then exit — for fetching older
+                          chunks without re-reading what you already have
       --local-no-sync     render the --sql file and exit: no Slack calls, no live stream
       --to-app-url=<id>   print the slack:// deep link for a message id and exit
       --to-web-url=<id>   print the https:// permalink for a message id and exit
@@ -79,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut backfill_arg: Option<String> = None;
     let mut sql_path: Option<String> = None;
     let mut local_no_sync = false;
+    let mut before_arg: Option<String> = None;
     let mut env_path: Option<String> = None;
     // (message id, web form?) — the two link flags differ only in the spelling.
     let mut link_for: Option<(String, bool)> = None;
@@ -95,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             other if other.starts_with("--sql=") => {
                 sql_path = Some(other.trim_start_matches("--sql=").to_string());
+            }
+            "--before" => {
+                before_arg = Some(args.next().ok_or("missing date for --before (e.g. --before=2026-05-13)")?);
+            }
+            other if other.starts_with("--before=") => {
+                before_arg = Some(other.trim_start_matches("--before=").to_string());
             }
             "--local-no-sync" => local_no_sync = true,
             "--env" => {
@@ -221,8 +231,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // time, and so where an interrupt is most likely to land.
     let mut interrupted = false;
 
+    if before_arg.is_some() && backfill_arg.is_none() {
+        return Err("--before needs -t as well, to say how far back from that date to load".into());
+    }
+
     if let Some(t_str) = &backfill_arg {
         let duration = parse_duration(t_str).ok_or_else(|| format!("invalid -t value: {t_str:?} (try e.g. 1h, 30m, 2d)"))?;
+        // Without --before the window ends now, which is the ordinary case.
+        let newest = match &before_arg {
+            Some(date) => Some(
+                parse_date(date).ok_or_else(|| format!("invalid --before value: {date:?} (expected YYYY-MM-DD)"))?,
+            ),
+            None => None,
+        };
+        let end = match newest {
+            Some(newest) => newest,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs_f64(),
+        };
+        let oldest = end - duration.as_secs_f64();
+        let label = match &before_arg {
+            Some(date) => format!("{t_str} before {date}"),
+            None => format!("last {t_str}"),
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 // The window is written in one transaction at the end, so an
@@ -230,11 +262,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 eprintln!("\nInterrupted during backfill — nothing stored.");
                 interrupted = true;
             }
-            result = backfill(&client, &token, &cookie, &channels, &users, duration, t_str, store.as_ref()) => result?,
+            result = backfill(&client, &token, &cookie, &channels, &users, oldest, newest, &label, store.as_ref()) => result?,
         }
     }
 
-    if !interrupted {
+    // A --before run asks for one specific historical window, so it ends there
+    // rather than dropping into an endless live stream that would have to be
+    // interrupted by hand between chunks.
+    if !interrupted && before_arg.is_none() {
         let ws_url = fetch_rtm_url(&client, &token, &cookie).await?;
         if verbose {
             println!("Connecting to {ws_url}...");
@@ -420,6 +455,19 @@ fn replay_local(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Syn
     Ok(())
 }
 
+// A date is taken as local midnight of that day, and it marks the *newer* edge
+// of the window that -t reaches back from. Exclusive, so chaining chunks — each
+// run's --before being the previous one's oldest day — neither overlaps nor
+// leaves a gap.
+fn parse_date(s: &str) -> Option<f64> {
+    let date = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    Local
+        .from_local_datetime(&midnight)
+        .single()
+        .map(|dt| dt.timestamp() as f64)
+}
+
 // Backfills via search.messages instead of iterating conversations.history
 // per-channel: a single global, paginated query instead of ~200 individual
 // calls, and — crucially — search indexes thread replies too. (History-per-
@@ -432,15 +480,11 @@ async fn backfill(
     cookie: &str,
     channels: &HashMap<String, String>,
     users: &HashMap<String, String>,
-    duration: std::time::Duration,
+    oldest: f64,
+    newest: Option<f64>,
     label: &str,
     store: Option<&Store>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let oldest = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .checked_sub(duration)
-        .ok_or("duration too large")?
-        .as_secs_f64();
 
     // A failure part-way through — a rate limit is the likely one — must not
     // discard the pages that already came back. The search appends into this Vec
@@ -448,7 +492,8 @@ async fn backfill(
     // run carries on with it: print it, store it, then go live. Aborting would
     // throw away real work over a transient API error.
     let mut all_messages = Vec::new();
-    let outcome = search_messages_since(client, token, cookie, oldest, label, users, &mut all_messages).await;
+    let outcome =
+        search_messages_in_window(client, token, cookie, oldest, newest, label, users, &mut all_messages).await;
     eprintln!(); // finish the progress line
     if let Err(e) = outcome {
         eprintln!(
@@ -499,7 +544,7 @@ async fn backfill(
         None => vec![None; all_messages.len()],
     };
 
-    println!("--- {} historical message(s) since {label} ---", all_messages.len());
+    println!("--- {} historical message(s), {label} ---", all_messages.len());
     for (m, id) in all_messages.iter().zip(&ids) {
         print_message(
             *id,
@@ -544,22 +589,30 @@ fn tag_thread_parents(messages: &mut [HistMessage]) {
 // Slack's search "after:" modifier only has day granularity, so we ask for
 // one extra day of margin and then filter precisely by `oldest` ourselves —
 // exact regardless of timezone/day-boundary edges.
-async fn search_messages_since(
+async fn search_messages_in_window(
     client: &reqwest::Client,
     token: &str,
     cookie: &str,
     oldest: f64,
+    newest: Option<f64>,
     label: &str,
     users: &HashMap<String, String>,
     out: &mut Vec<HistMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let oldest_dt = Local.timestamp_opt(oldest as i64, 0).single().ok_or("bad oldest timestamp")?;
     let after_date = (oldest_dt - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
-    let query = format!("after:{after_date}");
+    let mut query = format!("after:{after_date}");
+    // Both modifiers get a day of margin, for the same reason: they only have
+    // day granularity, so the exact edges are enforced below instead.
+    if let Some(newest) = newest {
+        let newest_dt = Local.timestamp_opt(newest as i64, 0).single().ok_or("bad newest timestamp")?;
+        let before_date = (newest_dt + ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
+        query += &format!(" before:{before_date}");
+    }
 
     let mut page = 1u32;
     loop {
-        eprint!("\rSearching history since {label}: page {page}, {} message(s) so far...", out.len());
+        eprint!("\rSearching history, {label}: page {page}, {} message(s) so far...", out.len());
         std::io::stderr().flush().ok();
 
         let url = format!(
@@ -581,8 +634,11 @@ async fn search_messages_since(
         for item in &matches {
             let ts_str = item.get("ts").and_then(Value::as_str).unwrap_or_default();
             let Some(ts) = ts_str.parse::<f64>().ok() else { continue };
-            if ts < oldest {
-                continue; // outside the exact window — the day-granularity query is coarser
+            // Outside the exact window — the day-granularity query is coarser.
+            // The upper edge is exclusive, so chained chunks meet without
+            // overlapping: one run's --before is the previous one's oldest day.
+            if ts < oldest || newest.is_some_and(|newest| ts >= newest) {
+                continue;
             }
             // A bot post has no `user` and used to be dropped here entirely;
             // message_author falls back to the bot's own name instead.
