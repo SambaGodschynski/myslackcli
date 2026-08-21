@@ -206,30 +206,18 @@ impl Store {
         rows.collect()
     }
 
-    // Ordered by ts_epoch, which is chronological across every channel — the
-    // order the messages actually happened in, not the order they were written.
-    // A backfill inserts an older window after newer live messages already
-    // exist, so insertion order would be wrong. ts breaks ties so the output is
-    // stable between runs.
     pub fn load_messages(&self) -> rusqlite::Result<Vec<LocalMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.ts, m.channel_id, m.user_id, m.text, m.note, t.thread_ts
-             FROM messages m
-             LEFT JOIN threads t ON t.id = m.thread_id
-             ORDER BY m.ts_epoch, m.ts",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(LocalMessage {
-                id: r.get(0)?,
-                ts: r.get(1)?,
-                channel_id: r.get(2)?,
-                user_id: r.get(3)?,
-                text: r.get(4)?,
-                note: r.get(5)?,
-                thread_ts: r.get(6)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!("{MESSAGE_SELECT} {CHRONOLOGICAL}"))?;
+        let rows = stmt.query_map([], local_message)?;
         rows.collect()
+    }
+
+    // The far end of what's recorded — how far back the archive reaches, which
+    // is what tells you where the next --before window should start.
+    pub fn oldest_message(&self) -> rusqlite::Result<Option<LocalMessage>> {
+        self.conn
+            .query_row(&format!("{MESSAGE_SELECT} {CHRONOLOGICAL} LIMIT 1"), [], local_message)
+            .optional()
     }
 
     // A reaction isn't a message and has no row of its own, so its line borrows
@@ -265,6 +253,30 @@ impl Store {
             )
             .optional()
     }
+}
+
+// Shared by every read of the message table, so the two callers can't drift
+// apart on which columns they expect.
+const MESSAGE_SELECT: &str = "SELECT m.id, m.ts, m.channel_id, m.user_id, m.text, m.note, t.thread_ts
+     FROM messages m
+     LEFT JOIN threads t ON t.id = m.thread_id";
+
+// ts_epoch is chronological across every channel — the order the messages
+// happened in, not the order they were written. A backfill inserts an older
+// window after newer live messages already exist, so insertion order would be
+// wrong. ts breaks ties so the output is stable between runs.
+const CHRONOLOGICAL: &str = "ORDER BY m.ts_epoch, m.ts";
+
+fn local_message(r: &rusqlite::Row) -> rusqlite::Result<LocalMessage> {
+    Ok(LocalMessage {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        channel_id: r.get(2)?,
+        user_id: r.get(3)?,
+        text: r.get(4)?,
+        note: r.get(5)?,
+        thread_ts: r.get(6)?,
+    })
 }
 
 // Just enough of a message to address it: which conversation, which timestamp,

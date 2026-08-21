@@ -23,6 +23,7 @@ usage: myslackcli [options]
                           instead of at now, then exit — for fetching older
                           chunks without re-reading what you already have
       --local-no-sync     render the --sql file and exit: no Slack calls, no live stream
+      --oldest            show the oldest recorded message and exit
       --to-app-url=<id>   print the slack:// deep link for a message id and exit
       --to-web-url=<id>   print the https:// permalink for a message id and exit
       --env <file>        read SLACK_TOKEN/SLACK_COOKIE from this file
@@ -82,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut backfill_arg: Option<String> = None;
     let mut sql_path: Option<String> = None;
     let mut local_no_sync = false;
+    let mut show_oldest = false;
     let mut before_arg: Option<String> = None;
     let mut env_path: Option<String> = None;
     // (message id, web form?) — the two link flags differ only in the spelling.
@@ -107,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 before_arg = Some(other.trim_start_matches("--before=").to_string());
             }
             "--local-no-sync" => local_no_sync = true,
+            "--oldest" => show_oldest = true,
             "--env" => {
                 env_path = Some(args.next().ok_or("missing value for --env (e.g. --env=/path/.env)")?);
             }
@@ -164,6 +167,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok_or("--to-app-url/--to-web-url look the message up in the database, so they need --sql=<file>")?;
         let id: i64 = id.parse().map_err(|_| format!("message id must be a number, got {id:?}"))?;
         return print_link(path, id, *web);
+    }
+
+    if show_oldest {
+        let path = sql_path
+            .as_deref()
+            .ok_or("--oldest reads from the database, so it needs --sql=<file>")?;
+        if !std::path::Path::new(path).exists() {
+            return Err(format!("no such database: {path}").into());
+        }
+        return print_oldest(path);
     }
 
     // Offline mode renders the database and stops.
@@ -423,6 +436,30 @@ fn web_url(domain: &str, m: &MessageRef) -> String {
         url += &format!("?thread_ts={parent}&cid={}", m.channel_id);
     }
     url
+}
+
+// Prints how far back the archive reaches: the oldest message, rendered exactly
+// as it appears everywhere else, so its id and thread tag are usable too.
+fn print_oldest(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let store = Store::open(path)?;
+    let message = store
+        .oldest_message()?
+        .ok_or_else(|| format!("{path} holds no messages yet"))?;
+    let users = store.load_users()?;
+    let channels = store.load_channels()?;
+    print_message(
+        Some(message.id),
+        &message.ts,
+        &message.channel_id,
+        message.user_id.as_deref().unwrap_or("?"),
+        &message.text,
+        message.note.as_deref(),
+        message.thread_ts.as_deref(),
+        &channels,
+        &users,
+    );
+    store.close()?;
+    Ok(())
 }
 
 // Reproduces the terminal output from the database alone — no Slack calls, no
@@ -991,13 +1028,13 @@ fn describe_payload(msg: &Value, users: &HashMap<String, String>, text_is_empty:
             .map(|id| users.get(*id).cloned().unwrap_or_else(|| id.to_string()))
             .collect();
         let who = match (named.is_empty(), ids.len() - named.len()) {
-            (true, _) => "niemand".to_string(),
+            (true, _) => "nobody".to_string(),
             (false, 0) => named.join(", "),
             (false, rest) => format!("{} +{rest}", named.join(", ")),
         };
         let start = room.get("date_start").and_then(Value::as_i64).unwrap_or(0);
         let end = room.get("date_end").and_then(Value::as_i64).unwrap_or(0);
-        return Some(format!("[Anruf: {who} — {}m]", (end - start).max(0) / 60));
+        return Some(format!("[Call: {who} — {}m]", (end - start).max(0) / 60));
     }
 
     if let Some(files) = msg.get("files").and_then(Value::as_array).filter(|f| !f.is_empty()) {
@@ -1005,7 +1042,7 @@ fn describe_payload(msg: &Value, users: &HashMap<String, String>, text_is_empty:
             .get("name")
             .or_else(|| files[0].get("title"))
             .and_then(Value::as_str)
-            .unwrap_or("Datei");
+            .unwrap_or("file");
         let more = match files.len() {
             1 => String::new(),
             n => format!(" +{}", n - 1),
@@ -1019,10 +1056,10 @@ fn describe_payload(msg: &Value, users: &HashMap<String, String>, text_is_empty:
                 .get("title")
                 .or_else(|| atts[0].get("fallback"))
                 .and_then(Value::as_str)
-                .unwrap_or("Anhang");
+                .unwrap_or("attachment");
             return Some(format!("[Link: {label}]"));
         }
-        return Some("[kein Text]".to_string());
+        return Some("[no text]".to_string());
     }
 
     None
@@ -1438,7 +1475,7 @@ fn handle_event(
             let id = store.and_then(|s| s.message_id_by_ts(channel_id, target_ts).ok().flatten());
             // Wrapped in colons so resolve_emoji renders it like any other.
             let text = format!(":{reaction}:");
-            print_message(id, ts, channel_id, user_id, &text, Some("[Reaktion]"), None, channels, users);
+            print_message(id, ts, channel_id, user_id, &text, Some("[Reaction]"), None, channels, users);
         }
         "hello" if verbose => println!("(connected — hello received)"),
         "" => {} // no type field (e.g. reply acknowledgements) — ignore
@@ -1477,7 +1514,7 @@ mod tests {
                      "participant_history": ["UD25T8BEW", "UD0QC5Z8R", "UD1CGTWUQ"]}
         });
         assert_eq!(message_author(&m), "UD25T8BEW");
-        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Anruf: Michael, Ole, Johannes — 17m]");
+        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Call: Michael, Ole, Johannes — 17m]");
     }
 
     #[test]
@@ -1487,7 +1524,7 @@ mod tests {
             "room": {"created_by": "UD25T8BEW", "date_start": 0, "date_end": 60,
                      "participant_history": ["UD25T8BEW", "UD0QC5Z8R", "UD1CGTWUQ", "UX1", "UX2"]}
         });
-        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Anruf: Michael, Ole, Johannes +2 — 1m]");
+        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Call: Michael, Ole, Johannes +2 — 1m]");
     }
 
     #[test]
@@ -1527,7 +1564,7 @@ mod tests {
 
     #[test]
     fn an_empty_message_with_nothing_to_describe_still_says_so() {
-        assert_eq!(describe_payload(&json!({"text": ""}), &users(), true).unwrap(), "[kein Text]");
+        assert_eq!(describe_payload(&json!({"text": ""}), &users(), true).unwrap(), "[no text]");
     }
 
     // Real Jira-integration payload: `text` is empty, the body is in a block.

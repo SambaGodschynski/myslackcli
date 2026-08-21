@@ -40,11 +40,14 @@ keep the file out of the checkout (see Setup).
 
 ```bash
 ./myslackcli                  # live stream of every channel/DM you're in
-./myslackcli -t 1h            # also backfill the last hour first, then go live
-./myslackcli -v               # show connection/lifecycle chatter too
+./myslackcli -t 1h            # --time: backfill the last hour first, then go live
+./myslackcli -v               # --verbose: connection/lifecycle chatter too
 ./myslackcli --no-color       # plain text, no ANSI colors
 ./myslackcli --help           # all flags
 ```
+
+Mentions come out as names rather than ids: `@Ada Lovelace` for a person,
+`@team-qa` for a user group, `#general` for a channel reference.
 
 Messages that belong to a thread carry a short id like `[t:9x4t]` — the same one
 on every message of that thread, so filtering on `t:9x4t` pulls the whole
@@ -56,14 +59,14 @@ to show nothing but a name and a colon. They now say what they are:
 
 ```
 [18.08.26 15:02:43] [#general] Ada Lovelace: [Upload: diagram.png +2] have a look
-[18.08.26 15:10:11] [#general] Ada Lovelace: [Anruf: Ada, Grace, Alan — 17m]
+[18.08.26 15:10:11] [#general] Ada Lovelace: [Call: Ada, Grace, Alan — 17m]
 [18.08.26 15:11:02] [#general] Grace Hopper: [Link: Improbable Research #129]
 ```
 
 A bot post names itself instead of carrying a user id, so it's attributed to the
 bot rather than to `?`, and integrations that post Block Kit (Jira, Confluence)
 get their text reassembled from the blocks. Reactions appear live as
-`[Reaktion] 👍`; they aren't messages, so they aren't recorded.
+`[Reaction] 👍`; they aren't messages, so they aren't recorded.
 
 Pipes nicely into a fuzzy-finder:
 ```bash
@@ -91,15 +94,23 @@ how you pull in older chunks:
 ./myslackcli --before=2026-02-02 -t 100d --sql=slack.db   # days 200–300
 ```
 
+`--oldest` says how far back the file already reaches, which is where the next
+chunk should end:
+
+```bash
+./myslackcli --sql=slack.db --oldest
+1 [20.05.26 11:51:40] [#support] [t:sw8t] Ada Lovelace: …
+```
+
+Expect to be rate limited on windows this size. Slack answers with how long to
+wait and the run waits it out — `Rate limited by Slack — waiting 30s (1/5)` is
+progress, not a hang. If the limit outlasts that budget, the load stops early,
+keeps and stores what it already fetched, and says how much that was.
+
 The date is that newer edge, and it's exclusive — local midnight of the day you
 name. So using one chunk's oldest day as the next `--before` neither overlaps
 nor leaves a gap. A `--before` run also exits once the window is loaded instead
 of dropping into the live stream, so chunks can be chained in a script.
-
-Re-reading a window you already had was never a correctness problem — a message
-is uniquely (channel, ts) and every write is an upsert, so nothing was ever
-stored twice. It cost requests, and a wide window is exactly where Slack's rate
-limit bites.
 
 ## Jumping back into Slack
 
