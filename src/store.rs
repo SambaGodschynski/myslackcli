@@ -33,6 +33,11 @@ pub struct StoredMessage<'a> {
     pub ts: &'a str,
     pub user_id: Option<&'a str>,
     pub text: &'a str,
+    // A short label for what the message is — an upload, a call, a link — for
+    // the cases where Slack leaves `text` empty and puts the substance
+    // elsewhere. Stored because it is derived from fields the database doesn't
+    // keep (`files`, `room`, `attachments`), so a replay could not rebuild it.
+    pub note: Option<&'a str>,
     pub thread_ts: Option<&'a str>,
     pub thread_tag: Option<&'a str>,
     pub mentions: Vec<String>,
@@ -66,6 +71,7 @@ CREATE TABLE IF NOT EXISTS messages (
     user_id    TEXT             REFERENCES users(id),
     thread_id  INTEGER          REFERENCES threads(id),
     text       TEXT    NOT NULL, -- exactly as Slack sent it
+    note       TEXT,               -- what the message is, when the text alone doesn't say
     UNIQUE (channel_id, ts)
 );
 
@@ -99,6 +105,15 @@ impl Store {
         // file on power loss, unlike under WAL.
         conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a
+        // database written before `note` needs the column added rather than
+        // rebuilt. Older rows keep NULL, which renders as it always did.
+        let has_note = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'note'")?
+            .exists([])?;
+        if !has_note {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN note TEXT")?;
+        }
         Ok(Self { conn })
     }
 
@@ -198,7 +213,7 @@ impl Store {
     // stable between runs.
     pub fn load_messages(&self) -> rusqlite::Result<Vec<LocalMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.ts, m.channel_id, m.user_id, m.text, t.thread_ts
+            "SELECT m.id, m.ts, m.channel_id, m.user_id, m.text, m.note, t.thread_ts
              FROM messages m
              LEFT JOIN threads t ON t.id = m.thread_id
              ORDER BY m.ts_epoch, m.ts",
@@ -210,10 +225,24 @@ impl Store {
                 channel_id: r.get(2)?,
                 user_id: r.get(3)?,
                 text: r.get(4)?,
-                thread_ts: r.get(5)?,
+                note: r.get(5)?,
+                thread_ts: r.get(6)?,
             })
         })?;
         rows.collect()
+    }
+
+    // A reaction isn't a message and has no row of its own, so its line borrows
+    // the id of the message it was left on: selecting it then leads to that
+    // message. None when the target isn't in the database.
+    pub fn message_id_by_ts(&self, channel_id: &str, ts: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM messages WHERE channel_id = ?1 AND ts = ?2",
+                params![channel_id, ts],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     // Looks up the one message a link is being built for. Returns None when the
@@ -253,6 +282,7 @@ pub struct LocalMessage {
     pub channel_id: String,
     pub user_id: Option<String>,
     pub text: String,
+    pub note: Option<String>,
     pub thread_ts: Option<String>,
 }
 
@@ -283,13 +313,14 @@ fn insert_message(conn: &Connection, m: &StoredMessage) -> rusqlite::Result<i64>
     // already stored, so conflicts update the mutable columns rather than being
     // ignored — and RETURNING hands back the row id either way.
     let message_id: i64 = conn.query_row(
-        "INSERT INTO messages (channel_id, ts, ts_epoch, user_id, thread_id, text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO messages (channel_id, ts, ts_epoch, user_id, thread_id, text, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(channel_id, ts) DO UPDATE SET
              ts_epoch  = excluded.ts_epoch,
              user_id   = excluded.user_id,
              thread_id = excluded.thread_id,
-             text      = excluded.text
+             text      = excluded.text,
+             note      = excluded.note
          RETURNING id",
         params![
             m.channel_id,
@@ -297,7 +328,8 @@ fn insert_message(conn: &Connection, m: &StoredMessage) -> rusqlite::Result<i64>
             m.ts.parse::<f64>().unwrap_or(0.0),
             m.user_id,
             thread_id,
-            m.text
+            m.text,
+            m.note
         ],
         |row| row.get(0),
     )?;

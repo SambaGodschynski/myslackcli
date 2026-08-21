@@ -68,6 +68,7 @@ struct HistMessage {
     channel_id: String,
     user_id: String,
     text: String,
+    note: Option<String>,
     thread_ts: Option<String>,
 }
 
@@ -174,7 +175,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if verbose {
         println!("Resolving users/channels...");
     }
-    let users = fetch_users(&client, &token, &cookie).await?;
+    let mut users = fetch_users(&client, &token, &cookie).await?;
+    // This workspace mentions a group as <@S…> — the very same syntax as a
+    // person, and resolved against the same map — so the groups belong in it.
+    // Not fatal: without them a group mention just stays an id, as it did
+    // before, which is no reason to give up the run.
+    match fetch_user_groups(&client, &token, &cookie).await {
+        Ok(groups) => users.extend(groups),
+        Err(e) => eprintln!("could not resolve user groups ({e}) — they stay as ids"),
+    }
+    let users = users;
     let channel_rows = fetch_channels(&client, &token, &cookie, &users).await?;
     let channels: HashMap<String, String> =
         channel_rows.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
@@ -400,6 +410,7 @@ fn replay_local(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Syn
             // Mirrors the live path, which prints "?" when an event named no user.
             m.user_id.as_deref().unwrap_or("?"),
             &m.text,
+            m.note.as_deref(),
             m.thread_ts.as_deref(),
             &channels,
             &users,
@@ -437,7 +448,7 @@ async fn backfill(
     // run carries on with it: print it, store it, then go live. Aborting would
     // throw away real work over a transient API error.
     let mut all_messages = Vec::new();
-    let outcome = search_messages_since(client, token, cookie, oldest, label, &mut all_messages).await;
+    let outcome = search_messages_since(client, token, cookie, oldest, label, users, &mut all_messages).await;
     eprintln!(); // finish the progress line
     if let Err(e) = outcome {
         eprintln!(
@@ -468,6 +479,7 @@ async fn backfill(
                     ts: &m.ts_raw,
                     user_id: Some(m.user_id.as_str()),
                     text: &m.text,
+                    note: m.note.as_deref(),
                     thread_ts: m.thread_ts.as_deref(),
                     thread_tag: tag.as_deref(),
                     mentions: extract_mentions(&m.text),
@@ -495,6 +507,7 @@ async fn backfill(
             &m.channel_id,
             &m.user_id,
             &m.text,
+            m.note.as_deref(),
             m.thread_ts.as_deref(),
             channels,
             users,
@@ -537,6 +550,7 @@ async fn search_messages_since(
     cookie: &str,
     oldest: f64,
     label: &str,
+    users: &HashMap<String, String>,
     out: &mut Vec<HistMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let oldest_dt = Local.timestamp_opt(oldest as i64, 0).single().ok_or("bad oldest timestamp")?;
@@ -570,12 +584,12 @@ async fn search_messages_since(
             if ts < oldest {
                 continue; // outside the exact window — the day-granularity query is coarser
             }
-            let user_id = item.get("user").and_then(Value::as_str).unwrap_or_default();
-            if user_id.is_empty() {
-                continue;
-            }
+            // A bot post has no `user` and used to be dropped here entirely;
+            // message_author falls back to the bot's own name instead.
+            let user_id = message_author(item);
             let channel_id = item.get("channel").and_then(|c| c.get("id")).and_then(Value::as_str).unwrap_or_default();
-            let text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            let text = message_text(item);
+            let note = describe_payload(item, users, text.is_empty());
             let thread_ts = item
                 .get("thread_ts")
                 .and_then(Value::as_str)
@@ -587,6 +601,7 @@ async fn search_messages_since(
                 channel_id: channel_id.to_string(),
                 user_id: user_id.to_string(),
                 text,
+                note,
                 thread_ts,
             });
         }
@@ -720,6 +735,31 @@ async fn fetch_users(
 // Returns rows rather than a name map so the display name and the channel's
 // kind stay together: a DM is recorded as a channel of kind 'dm' rather than as
 // a separate concept, which keeps every message referencing exactly one channel.
+// User groups (@team-qa and the like) are their own kind of id, but they are
+// mentioned exactly like people, so they're returned in the same shape and
+// merged into the same map. The handle is what Slack displays, not the name:
+// "gd-dev-dgk" rather than "Developer digitalklang (GD)".
+async fn fetch_user_groups(
+    client: &reqwest::Client,
+    token: &str,
+    cookie: &str,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = slack_get(client, token, cookie, "https://slack.com/api/usergroups.list").await?;
+    let mut groups = HashMap::new();
+    for g in resp.get("usergroups").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+        let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
+        let handle = g
+            .get("handle")
+            .and_then(Value::as_str)
+            .filter(|h| !h.is_empty())
+            .or_else(|| g.get("name").and_then(Value::as_str));
+        if let (false, Some(handle)) = (id.is_empty(), handle) {
+            groups.insert(id.to_string(), handle.to_string());
+        }
+    }
+    Ok(groups)
+}
+
 async fn fetch_channels(
     client: &reqwest::Client,
     token: &str,
@@ -799,6 +839,137 @@ fn format_slack_ts(ts: &str) -> String {
     let seconds = ts.parse::<f64>().ok();
     let datetime = seconds.and_then(|s| Local.timestamp_opt(s as i64, 0).single());
     datetime.unwrap_or_else(Local::now).format("%d.%m.%y %H:%M:%S").to_string()
+}
+
+// Not every message carries a `user`: a bot post identifies itself with
+// `username`/`bot_id` instead, which is why those lines printed as "?". A
+// huddle is posted by USLACKBOT, so the person who started it — in
+// `room.created_by` — is the useful attribution there rather than "Slackbot".
+fn message_author(msg: &Value) -> &str {
+    if msg.get("subtype").and_then(Value::as_str) == Some("huddle_thread") {
+        if let Some(creator) = msg.get("room").and_then(|r| r.get("created_by")).and_then(Value::as_str) {
+            return creator;
+        }
+    }
+    msg.get("user")
+        .and_then(Value::as_str)
+        .or_else(|| msg.get("username").and_then(Value::as_str))
+        .or_else(|| msg.get("bot_id").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("?")
+}
+
+// Bot integrations (Jira, Confluence, alerting) post Block Kit payloads and
+// leave `text` empty, which is why those lines showed only a name and a colon.
+// The body has to be reassembled from the block tree instead.
+fn message_text(msg: &Value) -> String {
+    let text = msg.get("text").and_then(Value::as_str).unwrap_or_default();
+    if !text.is_empty() {
+        return text.to_string();
+    }
+    text_from_blocks(msg).unwrap_or_default()
+}
+
+// Leaves within one top-level block are inline runs and get concatenated;
+// separate blocks become separate lines.
+fn text_from_blocks(msg: &Value) -> Option<String> {
+    let blocks = msg.get("blocks")?.as_array()?;
+    let mut lines: Vec<String> = Vec::new();
+    for block in blocks {
+        let mut parts = Vec::new();
+        collect_block_text(block, &mut parts);
+        if !parts.is_empty() {
+            lines.push(parts.concat());
+        }
+    }
+    let joined = lines.join("\n");
+    (!joined.trim().is_empty()).then_some(joined)
+}
+
+fn collect_block_text(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            // A text leaf is {"type": "mrkdwn"|"plain_text"|"text", "text": "…"};
+            // anything else is structure worth descending into.
+            let is_text_leaf = matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("mrkdwn" | "plain_text" | "text")
+            );
+            if is_text_leaf {
+                if let Some(t) = map.get("text").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        out.push(t.to_string());
+                    }
+                    return;
+                }
+            }
+            for child in map.values() {
+                collect_block_text(child, out);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| collect_block_text(i, out)),
+        _ => {}
+    }
+}
+
+// Says what a message *is* when its text doesn't. Measured against this
+// workspace, an empty text means one of four things: a huddle (by far the most
+// common), a link Slack unfurled, an uploaded image, or some other uploaded
+// file. Each keeps its substance in a field of its own, and none of it survives
+// in `text` — so without this the line showed a name, a colon and nothing else.
+//
+// An unfurl is only described when there's no text of its own, since the
+// message normally repeats the link anyway; an upload is always described,
+// because a caption doesn't tell you what was attached.
+fn describe_payload(msg: &Value, users: &HashMap<String, String>, text_is_empty: bool) -> Option<String> {
+    if msg.get("subtype").and_then(Value::as_str) == Some("huddle_thread") {
+        let room = msg.get("room")?;
+        let ids: Vec<&str> = room
+            .get("participant_history")
+            .and_then(Value::as_array)
+            .map(|ps| ps.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let named: Vec<String> = ids
+            .iter()
+            .take(3)
+            .map(|id| users.get(*id).cloned().unwrap_or_else(|| id.to_string()))
+            .collect();
+        let who = match (named.is_empty(), ids.len() - named.len()) {
+            (true, _) => "niemand".to_string(),
+            (false, 0) => named.join(", "),
+            (false, rest) => format!("{} +{rest}", named.join(", ")),
+        };
+        let start = room.get("date_start").and_then(Value::as_i64).unwrap_or(0);
+        let end = room.get("date_end").and_then(Value::as_i64).unwrap_or(0);
+        return Some(format!("[Anruf: {who} — {}m]", (end - start).max(0) / 60));
+    }
+
+    if let Some(files) = msg.get("files").and_then(Value::as_array).filter(|f| !f.is_empty()) {
+        let name = files[0]
+            .get("name")
+            .or_else(|| files[0].get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("Datei");
+        let more = match files.len() {
+            1 => String::new(),
+            n => format!(" +{}", n - 1),
+        };
+        return Some(format!("[Upload: {name}{more}]"));
+    }
+
+    if text_is_empty {
+        if let Some(atts) = msg.get("attachments").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+            let label = atts[0]
+                .get("title")
+                .or_else(|| atts[0].get("fallback"))
+                .and_then(Value::as_str)
+                .unwrap_or("Anhang");
+            return Some(format!("[Link: {label}]"));
+        }
+        return Some("[kein Text]".to_string());
+    }
+
+    None
 }
 
 // Slack's own thread identity is (channel, thread_ts) — far too long to scan
@@ -1107,6 +1278,7 @@ fn print_message(
     channel_id: &str,
     user_id: &str,
     text: &str,
+    note: Option<&str>,
     thread_ts: Option<&str>,
     channels: &HashMap<String, String>,
     users: &HashMap<String, String>,
@@ -1122,7 +1294,16 @@ fn print_message(
         Some(t) => format!(" {magenta}[t:{}]{reset}", thread_tag(channel_id, t)),
         None => String::new(),
     };
-    let line = format!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {text}");
+    // The label leads the body: for an upload or a call it *is* the body, and
+    // where there's text too it says what the text is about. Left uncoloured —
+    // the brackets already set it apart, and a dimmed grey reads as too faint
+    // against a dark terminal.
+    let body = match note {
+        Some(n) if text.is_empty() => n.to_string(),
+        Some(n) => format!("{n} {text}"),
+        None => text,
+    };
+    let line = format!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {body}");
     match id {
         // A message can span several lines, and a pager treats each of them as
         // its own entry — so every line carries the id, not just the first.
@@ -1145,8 +1326,9 @@ fn handle_event(
     match event_type {
         "message" => {
             let channel_id = event.get("channel").and_then(Value::as_str).unwrap_or("?");
-            let user_id = event.get("user").and_then(Value::as_str).unwrap_or("?");
-            let text = event.get("text").and_then(Value::as_str).unwrap_or("");
+            let user_id = message_author(event);
+            let text = message_text(event);
+            let note = describe_payload(event, users, text.is_empty());
             let ts = event.get("ts").and_then(Value::as_str).unwrap_or("");
             // Present on every reply, and on the parent itself once it has
             // replies — so a live thread shows the same tag on both.
@@ -1163,10 +1345,11 @@ fn handle_event(
                     // "?" is our stand-in for an event with no `user` field, not
                     // a Slack id — better stored as unknown than as a fake user.
                     user_id: (user_id != "?").then_some(user_id),
-                    text,
+                    text: &text,
+                    note: note.as_deref(),
                     thread_ts,
                     thread_tag: tag.as_deref(),
-                    mentions: extract_mentions(text),
+                    mentions: extract_mentions(&text),
                 };
                 // A failed write must not take the stream down with it — the
                 // message still prints, just without an id to link back to.
@@ -1175,7 +1358,31 @@ fn handle_event(
                     Err(e) => eprintln!("sqlite write failed for {channel_id}/{ts}: {e}"),
                 }
             }
-            print_message(id, ts, channel_id, user_id, text, thread_ts, channels, users);
+            print_message(id, ts, channel_id, user_id, &text, note.as_deref(), thread_ts, channels, users);
+        }
+        // A reaction is its own event type, not a message, which is why these
+        // never showed up at all. It carries no text of its own: the emoji is in
+        // `reaction` and the message it was left on one level down in `item`.
+        //
+        // It gets no row of its own — it isn't a message — so the line borrows
+        // the id of the message reacted to. That keeps the first column a usable
+        // id, and following it leads to the message the reaction is about. With
+        // no --sql, or a target that isn't stored, there's no id to borrow.
+        "reaction_added" => {
+            let item = event.get("item");
+            let channel_id = item
+                .and_then(|i| i.get("channel"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let target_ts = item.and_then(|i| i.get("ts")).and_then(Value::as_str).unwrap_or("");
+            let user_id = event.get("user").and_then(Value::as_str).unwrap_or("?");
+            let ts = event.get("event_ts").and_then(Value::as_str).unwrap_or("");
+            let reaction = event.get("reaction").and_then(Value::as_str).unwrap_or("");
+
+            let id = store.and_then(|s| s.message_id_by_ts(channel_id, target_ts).ok().flatten());
+            // Wrapped in colons so resolve_emoji renders it like any other.
+            let text = format!(":{reaction}:");
+            print_message(id, ts, channel_id, user_id, &text, Some("[Reaktion]"), None, channels, users);
         }
         "hello" if verbose => println!("(connected — hello received)"),
         "" => {} // no type field (e.g. reply acknowledgements) — ignore
@@ -1187,7 +1394,113 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The JSON below is real message shapes from this workspace, taken via
+    // conversations.history — which returns the same objects the RTM stream
+    // delivers as "message" events, so these cover the live path too.
+    fn users() -> HashMap<String, String> {
+        [("UD25T8BEW", "Michael"), ("UD0QC5Z8R", "Ole"), ("UD1CGTWUQ", "Johannes")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_bot_post_is_attributed_to_the_bot_instead_of_questionmark() {
+        let m = json!({"subtype": "bot_message", "text": "hi", "username": "Karma", "bot_id": "BQCJMA6DD"});
+        assert_eq!(message_author(&m), "Karma");
+    }
+
+    #[test]
+    fn a_huddle_is_attributed_to_whoever_started_it_not_to_slackbot() {
+        let m = json!({
+            "subtype": "huddle_thread", "user": "USLACKBOT", "text": "",
+            "room": {"created_by": "UD25T8BEW", "date_start": 1781248493, "date_end": 1781249546,
+                     "participant_history": ["UD25T8BEW", "UD0QC5Z8R", "UD1CGTWUQ"]}
+        });
+        assert_eq!(message_author(&m), "UD25T8BEW");
+        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Anruf: Michael, Ole, Johannes — 17m]");
+    }
+
+    #[test]
+    fn a_huddle_with_more_than_three_participants_counts_the_rest() {
+        let m = json!({
+            "subtype": "huddle_thread", "user": "USLACKBOT", "text": "",
+            "room": {"created_by": "UD25T8BEW", "date_start": 0, "date_end": 60,
+                     "participant_history": ["UD25T8BEW", "UD0QC5Z8R", "UD1CGTWUQ", "UX1", "UX2"]}
+        });
+        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Anruf: Michael, Ole, Johannes +2 — 1m]");
+    }
+
+    #[test]
+    fn an_upload_reports_its_filename() {
+        let m = json!({"text": "", "upload": true, "user": "U03BN4TDFEC",
+                       "files": [{"name": "Bild von iOS.jpg", "mimetype": "image/jpeg"}]});
+        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Upload: Bild von iOS.jpg]");
+    }
+
+    #[test]
+    fn several_uploads_count_the_remainder() {
+        let m = json!({"text": "", "files": [{"name": "a.mp4"}, {"name": "b.pdf"}]});
+        assert_eq!(describe_payload(&m, &users(), true).unwrap(), "[Upload: a.mp4 +1]");
+    }
+
+    #[test]
+    fn a_caption_does_not_hide_what_was_uploaded() {
+        let m = json!({"text": "schau mal", "files": [{"name": "image.png", "mimetype": "image/png"}]});
+        assert_eq!(describe_payload(&m, &users(), false).unwrap(), "[Upload: image.png]");
+    }
+
+    #[test]
+    fn an_unfurl_is_described_only_when_the_message_has_no_text_of_its_own() {
+        let empty = json!({"text": "", "attachments": [{"title": "Internetz-TV", "fallback": "YouTube Video"}]});
+        assert_eq!(describe_payload(&empty, &users(), true).unwrap(), "[Link: Internetz-TV]");
+
+        let with_text = json!({"text": "<https://youtu.be/x>", "attachments": [{"title": "Internetz-TV"}]});
+        assert_eq!(describe_payload(&with_text, &users(), false), None);
+    }
+
+    #[test]
+    fn ordinary_text_gets_no_label() {
+        let m = json!({"text": "hello", "user": "UD25T8BEW"});
+        assert_eq!(describe_payload(&m, &users(), false), None);
+        assert_eq!(message_author(&m), "UD25T8BEW");
+    }
+
+    #[test]
+    fn an_empty_message_with_nothing_to_describe_still_says_so() {
+        assert_eq!(describe_payload(&json!({"text": ""}), &users(), true).unwrap(), "[kein Text]");
+    }
+
+    // Real Jira-integration payload: `text` is empty, the body is in a block.
+    #[test]
+    fn block_kit_body_is_recovered_when_text_is_empty() {
+        let m = json!({"text": "", "username": "jira cloud", "blocks": [
+            {"type": "section", "block_id": "no:ih:1", "text": {"type": "mrkdwn",
+             "text": "*Marius Exner created a Bug*\n*BCRT-206 Patienten landen*"}}]});
+        assert_eq!(message_text(&m), "*Marius Exner created a Bug*\n*BCRT-206 Patienten landen*");
+        // With text recovered there is nothing left to label.
+        assert_eq!(describe_payload(&m, &users(), false), None);
+    }
+
+    #[test]
+    fn inline_runs_stay_on_one_line_while_blocks_become_separate_lines() {
+        let m = json!({"text": "", "blocks": [
+            {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+                {"type": "text", "text": "hello "}, {"type": "text", "text": "world"}]}]},
+            {"type": "divider"},
+            {"type": "section", "text": {"type": "plain_text", "text": "second"}}]});
+        assert_eq!(message_text(&m), "hello world\nsecond");
+    }
+
+    #[test]
+    fn a_present_text_field_wins_over_blocks() {
+        let m = json!({"text": "real", "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "block"}}]});
+        assert_eq!(message_text(&m), "real");
+    }
 
     fn rate_limited() -> String {
         "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()
