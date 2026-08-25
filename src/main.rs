@@ -28,6 +28,8 @@ usage: myslackcli [options]
       --to-web-url=<id>   print the https:// permalink for a message id and exit
       --env <file>        read SLACK_TOKEN/SLACK_COOKIE from this file
                           (default: ~/.config/myslackcli/.env)
+      --time-format <fmt> strftime pattern for the timestamp
+                          (default: %d.%m.%y %H:%M:%S; empty hides it)
       --no-color          plain output without ANSI colours
   -v, --verbose           report progress while running
   -h, --help              show this message
@@ -44,6 +46,22 @@ const RESET: &str = "\x1b[0m";
 // like fzf can display ANSI-colored input fine via their own --ansi flag,
 // so this doesn't need to auto-disable based on whether stdout is a TTY.)
 static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// strftime pattern for the timestamp, set once at startup. Empty means the
+// timestamp is left out of the line altogether.
+static TIME_FORMAT: OnceLock<String> = OnceLock::new();
+const DEFAULT_TIME_FORMAT: &str = "%d.%m.%y %H:%M:%S";
+
+fn time_format() -> &'static str {
+    TIME_FORMAT.get().map(String::as_str).unwrap_or(DEFAULT_TIME_FORMAT)
+}
+
+// chrono only reports a bad pattern when the formatted value is written, and it
+// panics doing so — so the pattern is checked once here instead of blowing up
+// mid-stream on the first message.
+fn is_valid_time_format(fmt: &str) -> bool {
+    !chrono::format::StrftimeItems::new(fmt).any(|item| matches!(item, chrono::format::Item::Error))
+}
 
 fn color_enabled() -> bool {
     *COLOR_ENABLED.get().unwrap_or(&false)
@@ -84,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut sql_path: Option<String> = None;
     let mut local_no_sync = false;
     let mut show_oldest = false;
+    let mut time_format_arg: Option<String> = None;
     let mut before_arg: Option<String> = None;
     let mut env_path: Option<String> = None;
     // (message id, web form?) — the two link flags differ only in the spelling.
@@ -110,6 +129,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             "--local-no-sync" => local_no_sync = true,
             "--oldest" => show_oldest = true,
+            "--time-format" => {
+                time_format_arg =
+                    Some(args.next().ok_or("missing value for --time-format (pass '' to hide the timestamp)")?);
+            }
+            other if other.starts_with("--time-format=") => {
+                let (_, fmt) = other.split_once('=').expect("checked by the guard");
+                time_format_arg = Some(fmt.to_string());
+            }
             "--env" => {
                 env_path = Some(args.next().ok_or("missing value for --env (e.g. --env=/path/.env)")?);
             }
@@ -141,6 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     COLOR_ENABLED.set(!no_color).ok();
+    if let Some(fmt) = time_format_arg {
+        if !is_valid_time_format(&fmt) {
+            return Err(format!("invalid --time-format: {fmt:?}").into());
+        }
+        TIME_FORMAT.set(fmt).ok();
+    }
 
     match &env_path {
         // Named explicitly, so a path that doesn't load is an error rather than
@@ -929,9 +962,13 @@ async fn fetch_rtm_url(
 // Slack timestamps look like "1690000000.000100" (seconds.microseconds).
 // Falls back to the current local time if `ts` is missing or unparseable.
 fn format_slack_ts(ts: &str) -> String {
+    let fmt = time_format();
+    if fmt.is_empty() {
+        return String::new();
+    }
     let seconds = ts.parse::<f64>().ok();
     let datetime = seconds.and_then(|s| Local.timestamp_opt(s as i64, 0).single());
-    datetime.unwrap_or_else(Local::now).format("%d.%m.%y %H:%M:%S").to_string()
+    datetime.unwrap_or_else(Local::now).format(fmt).to_string()
 }
 
 // Not every message carries a `user`: a bot post identifies itself with
@@ -1396,7 +1433,13 @@ fn print_message(
         Some(n) => format!("{n} {text}"),
         None => text,
     };
-    let line = format!("{green}[{time}]{reset} {blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {body}");
+    // Empty format: no brackets and no separator either, rather than an empty
+    // pair of brackets sitting at the start of every line.
+    let stamp = match time.is_empty() {
+        true => String::new(),
+        false => format!("{green}[{time}]{reset} "),
+    };
+    let line = format!("{stamp}{blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {body}");
     match id {
         // A message can span several lines, and a pager treats each of them as
         // its own entry — so every line carries the id, not just the first.

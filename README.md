@@ -43,8 +43,16 @@ keep the file out of the checkout (see Setup).
 ./myslackcli -t 1h            # --time: backfill the last hour first, then go live
 ./myslackcli -v               # --verbose: connection/lifecycle chatter too
 ./myslackcli --no-color       # plain text, no ANSI colors
+./myslackcli --time-format=%R # strftime pattern for the timestamp
+./myslackcli --time-format=   # empty: leave the timestamp out entirely
 ./myslackcli --help           # all flags
 ```
+
+The timestamp is `%d.%m.%y %H:%M:%S` unless `--time-format` says otherwise; any
+strftime pattern works, and an empty one drops the field and its brackets rather
+than leaving `[]` at the start of every line. Note that Slack addresses messages
+to the microsecond while a formatted stamp shows at most seconds, so it can't be
+used to identify a message — that's what the id column is for.
 
 Mentions come out as names rather than ids: `@Ada Lovelace` for a person,
 `@team-qa` for a user group, `#general` for a channel reference.
