@@ -573,6 +573,11 @@ async fn backfill(
     }
 
     all_messages.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+    // Resuming a truncated window re-reads the message it resumed from, and the
+    // day of margin on the search can hand back the same message twice. The
+    // database would absorb that through its upsert, but the printed history
+    // shouldn't show it twice.
+    all_messages.dedup_by(|a, b| a.channel_id == b.channel_id && a.ts_raw == b.ts_raw);
     tag_thread_parents(&mut all_messages);
 
     // Stored before printing, because the row ids are the first column and only
@@ -669,6 +674,47 @@ async fn search_messages_in_window(
     users: &HashMap<String, String>,
     out: &mut Vec<HistMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Slack answers a search with at most MAX_SEARCH_PAGES pages and says nothing
+    // about what it left out. Because results come oldest first, a window denser
+    // than that is truncated at its *newer* end — and picking the next window
+    // from the oldest message loaded would then step straight over the missing
+    // part, leaving a hole that no later run revisits. So when a window runs
+    // into the limit, the search resumes from the newest message it did get and
+    // keeps going until the window is genuinely exhausted.
+    let mut floor = oldest;
+    loop {
+        let hit_limit =
+            search_one_pass(client, token, cookie, floor, newest, label, users, out).await?;
+        if !hit_limit {
+            break;
+        }
+        let Some(resume) = out.last().map(|m| m.ts) else { break };
+        if resume <= floor {
+            break; // no forward progress — stop rather than loop for ever
+        }
+        eprintln!("\n  …{label}: hit Slack's result limit, resuming from the newest message so far");
+        floor = resume;
+    }
+
+    Ok(())
+}
+
+// Slack caps a search at 100 pages of 100 results.
+const MAX_SEARCH_PAGES: i64 = 100;
+
+// Runs the pagination for one window and reports whether it stopped because
+// Slack ran out of pages rather than out of messages.
+#[allow(clippy::too_many_arguments)]
+async fn search_one_pass(
+    client: &reqwest::Client,
+    token: &str,
+    cookie: &str,
+    oldest: f64,
+    newest: Option<f64>,
+    label: &str,
+    users: &HashMap<String, String>,
+    out: &mut Vec<HistMessage>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let oldest_dt = Local.timestamp_opt(oldest as i64, 0).single().ok_or("bad oldest timestamp")?;
     let after_date = (oldest_dt - ChronoDuration::days(1)).format("%Y-%m-%d").to_string();
     let mut query = format!("after:{after_date}");
@@ -698,7 +744,7 @@ async fn search_messages_in_window(
             .cloned()
             .unwrap_or_default();
         if matches.is_empty() {
-            break;
+            return Ok(false);
         }
 
         for item in &matches {
@@ -739,12 +785,12 @@ async fn search_messages_in_window(
             .and_then(Value::as_i64)
             .unwrap_or(1);
         if (page as i64) >= page_count {
-            break;
+            // Slack reports its own ceiling as the page count, so reaching it at
+            // the ceiling means there is more beyond, not that we're done.
+            return Ok(page_count >= MAX_SEARCH_PAGES);
         }
         page += 1;
     }
-
-    Ok(())
 }
 
 // How often a single request is allowed to wait out a rate limit before giving
