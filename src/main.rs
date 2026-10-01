@@ -270,6 +270,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => None,
     };
 
+    // With a database in play it is the authority on names, not the API: a name
+    // already recorded is left alone by sync_users, and a DM linked to a user is
+    // shown by that user's name. Reading both back is what carries a correction
+    // into the live stream as well as the offline replay.
+    let (users, channels) = match &store {
+        Some(store) => (store.load_users()?, store.load_channels()?),
+        None => (users, channels),
+    };
+
     // Ctrl+C races the actual work instead of killing the process, so the run
     // ends by falling out of main: the database gets closed properly and a
     // half-written statement can't be left behind. The backfill is covered too,

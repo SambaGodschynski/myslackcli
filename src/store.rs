@@ -50,9 +50,17 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS channels (
-    id   TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL          -- 'channel' | 'dm' | 'unknown'
+    id      TEXT PRIMARY KEY,
+    name    TEXT NOT NULL,
+    kind    TEXT NOT NULL,      -- 'channel' | 'dm' | 'unknown'
+    -- The person on the other end of a DM, where it is known. Slack renames a
+    -- deleted account to deactivateduser121366 in both users.name and the
+    -- channel name, and once that has happened the real name is gone from the
+    -- API for good. Working it out from the messages is possible; having to
+    -- write it down twice, and watching the next sync undo it, is not. So the
+    -- name is corrected once in users.name, and a channel points at the user
+    -- rather than repeating the name.
+    user_id TEXT REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS threads (
@@ -114,6 +122,29 @@ impl Store {
         if !has_note {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN note TEXT")?;
         }
+
+        let has_user_id = conn
+            .prepare("SELECT 1 FROM pragma_table_info('channels') WHERE name = 'user_id'")?
+            .exists([])?;
+        if !has_user_id {
+            conn.execute_batch("ALTER TABLE channels ADD COLUMN user_id TEXT REFERENCES users(id)")?;
+            // Derived once, here, and never again: a DM's name is "DM: " plus
+            // the user's name *at the time Slack was asked*, so the two only
+            // correspond until someone corrects a name by hand. Linking at this
+            // moment captures the correspondence while it still holds.
+            //
+            // Only where exactly one user matches. Names repeat — this
+            // workspace has two "BCRT Daily" and two "Dipto Bormon" — and
+            // attributing a DM to the wrong person is worse than leaving it
+            // unlinked.
+            conn.execute_batch(
+                "UPDATE channels SET user_id = (
+                     SELECT u.id FROM users u WHERE 'DM: ' || u.name = channels.name
+                 )
+                 WHERE user_id IS NULL
+                   AND (SELECT COUNT(*) FROM users u WHERE 'DM: ' || u.name = channels.name) = 1",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -122,9 +153,17 @@ impl Store {
     pub fn sync_users(&self, users: &HashMap<String, String>) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
+            // DO NOTHING, not DO UPDATE: a name already written down stays.
+            // That is what makes a hand-corrected name survive the next sync —
+            // and it is the whole point, because for a deleted account Slack
+            // has nothing better to offer than "deactivateduser121366".
+            //
+            // The cost is that a genuine rename in Slack no longer reaches an
+            // existing row. For an archive of who said what, an old name is a
+            // smaller problem than a correction that keeps being undone.
             let mut stmt = tx.prepare(
                 "INSERT INTO users (id, name) VALUES (?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+                 ON CONFLICT(id) DO NOTHING",
             )?;
             for (id, name) in users {
                 stmt.execute(params![id, name])?;
@@ -136,6 +175,10 @@ impl Store {
     pub fn sync_channels(&self, rows: &[ChannelRow]) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
+            // name and kind still follow Slack; user_id is deliberately absent
+            // from the update, so a link set here or by hand is never undone.
+            // A linked channel is shown by its user's name anyway, which makes
+            // whatever Slack calls it moot.
             let mut stmt = tx.prepare(
                 "INSERT INTO channels (id, name, kind) VALUES (?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind",
@@ -200,8 +243,14 @@ impl Store {
         rows.collect()
     }
 
+    // The name to show for each channel. A channel linked to a user is named
+    // after that user, so correcting users.name fixes the DM listing too — one
+    // edit, both places.
     pub fn load_channels(&self) -> rusqlite::Result<HashMap<String, String>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM channels")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, CASE WHEN u.id IS NULL THEN c.name ELSE 'DM: ' || u.name END
+               FROM channels c LEFT JOIN users u ON u.id = c.user_id",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }

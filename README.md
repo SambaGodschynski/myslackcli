@@ -91,6 +91,40 @@ Pipes nicely into a fuzzy-finder:
 ./myslackcli --sql=slack.db --local-no-sync   # read the file instead of the server
 ```
 
+## Correcting a name
+
+Slack renames a deleted account to `deactivateduser121366`, in `users.name` and
+in the DM's channel name alike, and the real name is then gone from the API for
+good — `users.info` answers `real_name: null` and `display_name:
+"deactivateduser"`. It can often still be worked out from the messages
+themselves, so the database lets you write it down:
+
+```sql
+UPDATE users SET name = 'Erika Mustermann' WHERE id = 'U054NE7C21Y';
+```
+
+That is the only edit needed. **A name already in the database is never
+overwritten** — `sync_users` inserts new people and leaves existing rows alone —
+and a DM is shown by the name of the user it is linked to, so the correction
+reaches the channel listing and the `@mentions` inside message text as well.
+
+The link is a `channels.user_id` column, filled in once when the column is
+created: every DM whose name is `DM: ` plus exactly one user's name is matched
+up at that moment, while the two still correspond. In this workspace that
+linked 123 of 127 DMs. The four left over are the honest cases — two bots that
+have no user row, and two names that more than one user carries, where guessing
+would attribute a conversation to the wrong person. Those can be set by hand:
+
+```sql
+UPDATE channels SET user_id = 'U054NE7C21Y' WHERE id = 'D05DCCCLUBU';
+```
+
+A sync never touches `user_id`, so a link stays once it is there.
+
+The cost of not overwriting names is that a genuine rename in Slack no longer
+reaches a row that already exists. For an archive of who said what, an old name
+is a smaller problem than a correction that keeps being undone.
+
 ## Loading older history
 
 `-t` counts back from now, so reaching further means re-fetching everything you
