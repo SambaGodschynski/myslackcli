@@ -96,6 +96,15 @@ struct HistMessage {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Rust starts with SIGPIPE ignored, so printing into a pipe whose reader
+    // has gone (`| head`, a closed fzf) panics instead of ending quietly the
+    // way other command-line tools do. Sockets don't need the ignore: the
+    // standard library sends on them with MSG_NOSIGNAL.
+    #[cfg(unix)]
+    // SAFETY: plain FFI call that only resets a disposition, no handler.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let mut verbose = false;
     let mut no_color = false;
     let mut backfill_arg: Option<String> = None;
