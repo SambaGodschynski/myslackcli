@@ -108,18 +108,21 @@ overwritten** — `sync_users` inserts new people and leaves existing rows alone
 and a DM is shown by the name of the user it is linked to, so the correction
 reaches the channel listing and the `@mentions` inside message text as well.
 
-The link is a `channels.user_id` column, filled in once when the column is
-created: every DM whose name is `DM: ` plus exactly one user's name is matched
-up at that moment, while the two still correspond. In this workspace that
-linked 123 of 127 DMs. The four left over are the honest cases — two bots that
-have no user row, and two names that more than one user carries, where guessing
-would attribute a conversation to the wrong person. Those can be set by hand:
+The link is a `channels.user_id` column. Every sync fills it in for a DM that
+has none yet, from the user Slack names as the DM's other end, so the match is
+exact rather than by name. Only a user the database has a name for can be
+linked, so a DM with someone missing from Slack's user list, such as a bot,
+keeps the name Slack gives it. Once that user has a name, from Slack's list or
+written down by hand, the next sync links it. A link can also be set by hand:
 
 ```sql
 UPDATE channels SET user_id = 'U054NE7C21Y' WHERE id = 'D05DCCCLUBU';
 ```
 
-A sync never touches `user_id`, so a link stays once it is there.
+A sync only fills in a missing link and never changes one, so a link stays once
+it is there. A database from before the column existed gets its DMs linked by
+name once, when the column is added, so that a run that doesn't sync, such as
+`--local-no-sync`, shows them by their user as well.
 
 The cost of not overwriting names is that a genuine rename in Slack no longer
 reaches a row that already exists. For an archive of who said what, an old name
