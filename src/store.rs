@@ -21,6 +21,8 @@ pub struct ChannelRow {
     pub id: String,
     pub name: String,
     pub kind: &'static str,
+    // The other end of a DM, as Slack names it in conversations.list.
+    pub user_id: Option<String>,
 }
 
 // A message about to be written. `text` is stored exactly as Slack sent it —
@@ -128,10 +130,12 @@ impl Store {
             .exists([])?;
         if !has_user_id {
             conn.execute_batch("ALTER TABLE channels ADD COLUMN user_id TEXT REFERENCES users(id)")?;
-            // Derived once, here, and never again: a DM's name is "DM: " plus
-            // the user's name *at the time Slack was asked*, so the two only
-            // correspond until someone corrects a name by hand. Linking at this
-            // moment captures the correspondence while it still holds.
+            // The DMs already recorded, linked by name, once, here: a DM's name
+            // is "DM: " plus the user's name *at the time Slack was asked*, so
+            // the two only correspond until someone corrects a name by hand.
+            // Linking at this moment captures the correspondence while it
+            // still holds. From then on sync_channels links by the id Slack
+            // gives, which also covers a database created with the column.
             //
             // Only where exactly one user matches. Names repeat — this
             // workspace has two "BCRT Daily" and two "Dipto Bormon" — and
@@ -175,16 +179,22 @@ impl Store {
     pub fn sync_channels(&self, rows: &[ChannelRow]) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
-            // name and kind still follow Slack; user_id is deliberately absent
-            // from the update, so a link set here or by hand is never undone.
-            // A linked channel is shown by its user's name anyway, which makes
-            // whatever Slack calls it moot.
+            // name and kind still follow Slack. user_id is only filled in
+            // where it is missing, so a link set earlier or by hand is never
+            // undone; a linked channel is shown by its user's name anyway,
+            // which makes whatever Slack calls it moot. The id Slack gives is
+            // exact, unlike a match by name, but only a user with a name can
+            // be linked: a bot's DM partner may have no row, and ensure_user
+            // leaves a placeholder named by its id, which would otherwise
+            // replace the name Slack gives the DM.
             let mut stmt = tx.prepare(
-                "INSERT INTO channels (id, name, kind) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind",
+                "INSERT INTO channels (id, name, kind, user_id)
+                 VALUES (?1, ?2, ?3, (SELECT id FROM users WHERE id = ?4 AND name <> id))
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+                     user_id = COALESCE(channels.user_id, excluded.user_id)",
             )?;
             for r in rows {
-                stmt.execute(params![r.id, r.name, r.kind])?;
+                stmt.execute(params![r.id, r.name, r.kind, r.user_id])?;
             }
         }
         tx.commit()
@@ -416,4 +426,61 @@ fn ensure_user(conn: &Connection, id: &str) -> rusqlite::Result<()> {
         params![id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dm(id: &str, name: &str, user: Option<&str>) -> ChannelRow {
+        ChannelRow { id: id.into(), name: name.into(), kind: "dm", user_id: user.map(str::to_string) }
+    }
+
+    fn user_id(store: &Store, channel: &str) -> Option<String> {
+        store.conn.query_row("SELECT user_id FROM channels WHERE id = ?1", [channel], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_new_database_links_each_dm_so_a_corrected_name_reaches_it() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_users(&HashMap::from([("U1".to_string(), "deactivateduser1".to_string())])).unwrap();
+        store.sync_channels(&[dm("D1", "DM: deactivateduser1", Some("U1"))]).unwrap();
+        store.conn.execute("UPDATE users SET name = 'Erika Mustermann' WHERE id = 'U1'", []).unwrap();
+        assert_eq!(store.load_channels().unwrap()["D1"], "DM: Erika Mustermann");
+    }
+
+    #[test]
+    fn a_link_already_there_is_kept() {
+        let store = Store::open(":memory:").unwrap();
+        let users = HashMap::from([("U1".to_string(), "Ada".to_string()), ("U2".to_string(), "Grace".to_string())]);
+        store.sync_users(&users).unwrap();
+        store.sync_channels(&[dm("D1", "DM: Ada", None)]).unwrap();
+        store.conn.execute("UPDATE channels SET user_id = 'U2' WHERE id = 'D1'", []).unwrap();
+        store.sync_channels(&[dm("D1", "DM: Ada", Some("U1"))]).unwrap();
+        assert_eq!(user_id(&store, "D1").as_deref(), Some("U2"));
+    }
+
+    #[test]
+    fn a_dm_partner_without_a_user_row_stays_unlinked() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_channels(&[dm("D1", "DM: USLACKBOT", Some("USLACKBOT"))]).unwrap();
+        assert_eq!(user_id(&store, "D1"), None);
+        assert_eq!(store.load_channels().unwrap()["D1"], "DM: USLACKBOT");
+        store.sync_users(&HashMap::from([("USLACKBOT".to_string(), "Slackbot".to_string())])).unwrap();
+        store.sync_channels(&[dm("D1", "DM: Slackbot", Some("USLACKBOT"))]).unwrap();
+        assert_eq!(user_id(&store, "D1").as_deref(), Some("USLACKBOT"));
+    }
+
+    #[test]
+    fn a_placeholder_named_by_its_id_is_linked_only_once_it_has_a_name() {
+        let store = Store::open(":memory:").unwrap();
+        ensure_user(&store.conn, "U1").unwrap();
+        store.sync_users(&HashMap::from([("U1".to_string(), "Ada".to_string())])).unwrap();
+        store.sync_channels(&[dm("D1", "DM: Ada", Some("U1"))]).unwrap();
+        assert_eq!(user_id(&store, "D1"), None);
+        assert_eq!(store.load_channels().unwrap()["D1"], "DM: Ada");
+        store.conn.execute("UPDATE users SET name = 'Ada Lovelace' WHERE id = 'U1'", []).unwrap();
+        store.sync_channels(&[dm("D1", "DM: Ada", Some("U1"))]).unwrap();
+        assert_eq!(store.load_channels().unwrap()["D1"], "DM: Ada Lovelace");
+    }
 }

@@ -968,15 +968,17 @@ async fn fetch_channels(
                 continue;
             }
             let name = item.get("name").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let dm_user = item.get("user").and_then(Value::as_str);
             let (display, kind) = if let Some(n) = name {
                 (format!("#{n}"), "channel")
-            } else if let Some(dm_user) = item.get("user").and_then(Value::as_str) {
+            } else if let Some(dm_user) = dm_user {
                 let uname = users.get(dm_user).cloned().unwrap_or_else(|| dm_user.to_string());
                 (format!("DM: {uname}"), "dm")
             } else {
                 (id.to_string(), "unknown")
             };
-            channels.push(ChannelRow { id: id.to_string(), name: display, kind });
+            let user_id = if kind == "dm" { dm_user.map(str::to_string) } else { None };
+            channels.push(ChannelRow { id: id.to_string(), name: display, kind, user_id });
         }
 
         cursor = next_cursor(&resp);
