@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS channels (
     id      TEXT PRIMARY KEY,
     name    TEXT NOT NULL,
-    kind    TEXT NOT NULL,      -- 'channel' | 'dm' | 'unknown'
+    kind    TEXT NOT NULL,      -- 'channel' | 'dm' | 'group' | 'unknown'
     -- The person on the other end of a DM, where it is known. Slack renames a
     -- deleted account to deactivateduser121366 in both users.name and the
     -- channel name, and once that has happened the real name is gone from the

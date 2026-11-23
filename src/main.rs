@@ -1,7 +1,8 @@
 mod store;
+mod unread;
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::sync::OnceLock;
 
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
@@ -24,6 +25,15 @@ usage: myslackcli [options]
                           chunks without re-reading what you already have
       --local-no-sync     render the --sql file and exit: no Slack calls, no live stream
       --oldest            show the oldest recorded message and exit
+      --unread            print everything unread (conversations and threads) and exit
+      --mark-read <t>...  mark conversations or threads read and exit; each <t> is a
+                          name as --unread prints it (#general, 'DM: Ada Lovelace'),
+                          a thread tag (t:9x4t), a channel id, or - to read targets
+                          from stdin, one per line (lines of --unread output work)
+      --until <time>      with --mark-read: only up to this local time
+                          ('YYYY-MM-DD HH:MM[:SS]', optionally with an offset
+                          like '+01:00'), later messages stay unread
+      --dry-run           with --mark-read: show what would be marked, change nothing
       --to-app-url=<id>   print the slack:// deep link for a message id and exit
       --to-web-url=<id>   print the https:// permalink for a message id and exit
       --env <file>        read SLACK_TOKEN/SLACK_COOKIE from this file
@@ -102,12 +112,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut sql_path: Option<String> = None;
     let mut local_no_sync = false;
     let mut show_oldest = false;
+    let mut show_unread = false;
+    let mut mark_targets: Option<Vec<String>> = None;
+    let mut until_arg: Option<String> = None;
+    let mut dry_run = false;
     let mut time_format_arg: Option<String> = None;
     let mut before_arg: Option<String> = None;
     let mut env_path: Option<String> = None;
     // (message id, web form?) — the two link flags differ only in the spelling.
     let mut link_for: Option<(String, bool)> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "-v" | "--verbose" => verbose = true,
@@ -129,6 +143,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             "--local-no-sync" => local_no_sync = true,
             "--oldest" => show_oldest = true,
+            "--unread" => show_unread = true,
+            // Takes every following argument up to the next option, so several
+            // targets fit after one flag. A lone - is a target too (stdin).
+            "--mark-read" => {
+                let list = mark_targets.get_or_insert_with(Vec::new);
+                while let Some(t) = args.next_if(|a| !a.starts_with('-') || a == "-") {
+                    list.push(t);
+                }
+            }
+            other if other.starts_with("--mark-read=") => {
+                mark_targets.get_or_insert_with(Vec::new).push(other.trim_start_matches("--mark-read=").to_string());
+            }
+            "--until" => {
+                until_arg = Some(args.next().ok_or("missing time for --until (e.g. --until '2026-11-23 11:45')")?);
+            }
+            other if other.starts_with("--until=") => {
+                until_arg = Some(other.trim_start_matches("--until=").to_string());
+            }
+            "--dry-run" => dry_run = true,
             "--time-format" => {
                 time_format_arg =
                     Some(args.next().ok_or("missing value for --time-format (pass '' to hide the timestamp)")?);
@@ -166,6 +199,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 std::process::exit(2);
             }
         }
+    }
+    let other_mode = [
+        (show_unread, "--unread"),
+        (show_oldest, "--oldest"),
+        (local_no_sync, "--local-no-sync"),
+        (link_for.is_some(), "--to-app-url/--to-web-url"),
+    ];
+    let mode = if mark_targets.is_some() {
+        Some("--mark-read")
+    } else if show_unread {
+        Some("--unread")
+    } else {
+        None
+    };
+    let loading = [(backfill_arg.is_some(), "-t"), (before_arg.is_some(), "--before"), (sql_path.is_some(), "--sql")];
+    let conflict = flag_conflict(mark_targets.is_some(), until_arg.is_some() || dry_run, &other_mode)
+        .or_else(|| loading_conflict(mode, &loading))
+        .or_else(|| unread_conflict(show_unread, &other_mode[1..]));
+    if let Some(msg) = conflict {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
+    // Checked here rather than where it is used, so a typo fails before the
+    // channel and user lists are fetched.
+    let until_at = until_arg
+        .as_deref()
+        .map(|t| parse_local_time(t).map_err(|e| format!("invalid --until value: {t:?} ({e})")))
+        .transpose()?;
+    // Read before the first request too: an interactive stdin waits for the
+    // user, which should be obvious at once rather than after the channel
+    // list has loaded. Read in full before anything is marked: a list cut
+    // short by a bad byte would otherwise be marked in part and still exit 0.
+    let mut stdin_lines = Vec::new();
+    if mark_targets.as_ref().is_some_and(|t| t.iter().any(|a| a == "-")) {
+        if std::io::stdin().is_terminal() {
+            eprintln!("reading targets from stdin, end with Ctrl-D");
+        }
+        stdin_lines = std::io::stdin()
+            .lines()
+            .enumerate()
+            .map(|(i, l)| l.map_err(|e| format!("could not read stdin (line {}): {e}", i + 1)))
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    if let Some(raw) = &mark_targets
+        && !raw.iter().any(|a| a != "-")
+        && stdin_lines.iter().all(|l| unread::is_filler(l))
+    {
+        eprintln!("--mark-read: no targets given");
+        std::process::exit(2);
     }
     COLOR_ENABLED.set(!no_color).ok();
     if let Some(fmt) = time_format_arg {
@@ -246,6 +328,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         channel_rows.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
     if verbose {
         println!("{} user(s), {} channel(s)/DM(s) resolved", users.len(), channels.len());
+    }
+
+    if show_unread {
+        return unread::print_unread(&client, &token, &cookie, &channels, &users).await;
+    }
+
+    if let Some(raw) = mark_targets {
+        let until = match until_at {
+            Some(t) => t,
+            None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs_f64(),
+        };
+        let known: Vec<&str> = channels.values().map(String::as_str).collect();
+        let mut targets: Vec<unread::Target> = Vec::new();
+        let mut not_targets = 0;
+        for t in raw {
+            if t != "-" {
+                match unread::parse_target(&t, &known) {
+                    Some(target) => targets.push(target),
+                    None => {
+                        eprintln!("{t:?}: not a target");
+                        not_targets += 1;
+                    }
+                }
+                continue;
+            }
+            for line in std::mem::take(&mut stdin_lines) {
+                match unread::parse_target(&line, &known) {
+                    Some(target) => targets.push(target),
+                    None if unread::is_filler(&line) => {}
+                    None => {
+                        eprintln!("{line:?}: not a target");
+                        not_targets += 1;
+                    }
+                }
+            }
+        }
+        return unread::mark_read(&client, &token, &cookie, &channels, targets, not_targets, until, dry_run).await;
     }
 
     // Without --sql this stays None and not a single write happens.
@@ -384,6 +503,57 @@ fn default_env_path() -> Option<std::path::PathBuf> {
         _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
     Some(config_home.join("myslackcli").join(".env"))
+}
+
+// --mark-read is a mode of its own: the other modes return before it, so
+// combined with one of them it was skipped without a word, and --until and
+// --dry-run did nothing without it.
+fn flag_conflict(marking: bool, mark_options: bool, other_modes: &[(bool, &str)]) -> Option<String> {
+    if let Some((_, flag)) = other_modes.iter().find(|(set, _)| marking && *set) {
+        return Some(format!("--mark-read cannot be combined with {flag}"));
+    }
+    (!marking && mark_options).then(|| "--until and --dry-run only work with --mark-read".to_string())
+}
+
+// The link flags, --oldest and --local-no-sync return before --unread is
+// reached, so combined with one of them it was skipped without a word.
+fn unread_conflict(show_unread: bool, other_modes: &[(bool, &str)]) -> Option<String> {
+    let (_, flag) = other_modes.iter().find(|(set, _)| show_unread && *set)?;
+    Some(format!("--unread cannot be combined with {flag}"))
+}
+
+// --unread and --mark-read talk to the server and exit; -t, --before and
+// --sql load and store history, which neither of them does.
+fn loading_conflict(mode: Option<&str>, loading: &[(bool, &str)]) -> Option<String> {
+    let mode = mode?;
+    loading.iter().find(|(set, _)| *set).map(|(_, flag)| format!("{mode} cannot be combined with {flag}"))
+}
+
+// 'YYYY-MM-DD HH:MM[:SS]' (or with a T) in local time, or with an explicit
+// '+HH:MM' offset after it, as unix seconds.
+fn parse_local_time(s: &str) -> Result<f64, String> {
+    let s = s.trim().replacen('T', " ", 1);
+    // The `as of` line of --unread carries its offset.
+    if let Some(t) = ["%Y-%m-%d %H:%M:%S %:z", "%Y-%m-%d %H:%M %:z"]
+        .iter()
+        .find_map(|f| chrono::DateTime::parse_from_str(&s, f).ok())
+    {
+        return Ok(t.timestamp() as f64);
+    }
+    let naive = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(&s, f).ok())
+        .ok_or("expected YYYY-MM-DD HH:MM[:SS] [+HH:MM]")?;
+    earliest_instant(Local.from_local_datetime(&naive))
+}
+
+// A local time in the hour repeated when the clocks go back exists twice; the
+// earlier one marks less rather than more. One skipped when they go forward
+// doesn't exist at all.
+fn earliest_instant<Tz: TimeZone>(t: chrono::LocalResult<chrono::DateTime<Tz>>) -> Result<f64, String> {
+    t.earliest()
+        .map(|t| t.timestamp() as f64)
+        .ok_or_else(|| "does not exist in local time, the clocks go forward then".to_string())
 }
 
 // Parses "1h", "30m", "2d", "45s" (bare numbers are treated as seconds).
@@ -951,7 +1121,7 @@ async fn fetch_channels(
     let mut cursor: Option<String> = None;
 
     loop {
-        let mut url = "https://slack.com/api/conversations.list?types=public_channel,private_channel,im&exclude_archived=true&limit=200".to_string();
+        let mut url = "https://slack.com/api/conversations.list?types=public_channel,private_channel,mpim,im&exclude_archived=true&limit=200".to_string();
         if let Some(c) = &cursor {
             url += &format!("&cursor={}", urlencoding::encode(c));
         }
@@ -968,7 +1138,10 @@ async fn fetch_channels(
                 continue;
             }
             let name = item.get("name").and_then(Value::as_str).filter(|s| !s.is_empty());
-            let (display, kind) = if let Some(n) = name {
+            let is_mpim = item.get("is_mpim").and_then(Value::as_bool) == Some(true);
+            let (display, kind) = if let (true, Some(n)) = (is_mpim, name) {
+                (group_dm_name(n), "group")
+            } else if let Some(n) = name {
                 (format!("#{n}"), "channel")
             } else if let Some(dm_user) = item.get("user").and_then(Value::as_str) {
                 let uname = users.get(dm_user).cloned().unwrap_or_else(|| dm_user.to_string());
@@ -986,6 +1159,15 @@ async fn fetch_channels(
     }
 
     Ok(channels)
+}
+
+// Slack names a group DM after its members' handles: "mpdm-ada--grace--alan-1".
+fn group_dm_name(raw: &str) -> String {
+    let inner = raw.strip_prefix("mpdm-").unwrap_or(raw);
+    let inner = inner.rsplit_once('-').map_or(inner, |(head, tail)| {
+        if tail.chars().all(|c| c.is_ascii_digit()) { head } else { inner }
+    });
+    format!("Group: {}", inner.split("--").collect::<Vec<_>>().join(", "))
 }
 
 // rtm.connect is the officially documented way to get a ready-to-use wss://
@@ -1468,6 +1650,28 @@ fn print_message(
     channels: &HashMap<String, String>,
     users: &HashMap<String, String>,
 ) {
+    let line = format_message(ts, channel_id, user_id, text, note, thread_ts, channels, users);
+    match id {
+        // A message can span several lines, and a pager treats each of them as
+        // its own entry — so every line carries the id, not just the first.
+        // Otherwise selecting a continuation line resolves against whatever its
+        // first word happens to be.
+        Some(id) => line.split('\n').for_each(|l| println!("{id} {l}")),
+        None => println!("{line}"),
+    }
+}
+
+// The message as one string, several lines if the text has several.
+pub(crate) fn format_message(
+    ts: &str,
+    channel_id: &str,
+    user_id: &str,
+    text: &str,
+    note: Option<&str>,
+    thread_ts: Option<&str>,
+    channels: &HashMap<String, String>,
+    users: &HashMap<String, String>,
+) -> String {
     let channel_name = channels.get(channel_id).cloned().unwrap_or_else(|| channel_id.to_string());
     let user_name = users.get(user_id).cloned().unwrap_or_else(|| user_id.to_string());
     let time = format_slack_ts(ts);
@@ -1494,15 +1698,7 @@ fn print_message(
         true => String::new(),
         false => format!("{green}[{time}]{reset} "),
     };
-    let line = format!("{stamp}{blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {body}");
-    match id {
-        // A message can span several lines, and a pager treats each of them as
-        // its own entry — so every line carries the id, not just the first.
-        // Otherwise selecting a continuation line resolves against whatever its
-        // first word happens to be.
-        Some(id) => line.split('\n').for_each(|l| println!("{id} {l}")),
-        None => println!("{line}"),
-    }
+    format!("{stamp}{blue}[{channel_name}]{reset}{thread} {cyan}{user_name}{reset}: {body}")
 }
 
 fn handle_event(
@@ -1596,6 +1792,80 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn mark_read_refuses_other_modes_and_its_options_need_it() {
+        let unread = [(true, "--unread"), (false, "--oldest")];
+        let none = [(false, "--unread"), (false, "--oldest")];
+        assert_eq!(flag_conflict(true, false, &unread).as_deref(), Some("--mark-read cannot be combined with --unread"));
+        assert_eq!(flag_conflict(true, true, &none), None);
+        assert_eq!(flag_conflict(false, false, &unread), None);
+        assert!(flag_conflict(false, true, &none).is_some());
+    }
+
+    #[test]
+    fn unread_refuses_the_other_modes() {
+        let link = [(false, "--oldest"), (true, "--to-app-url/--to-web-url")];
+        assert_eq!(
+            unread_conflict(true, &link).as_deref(),
+            Some("--unread cannot be combined with --to-app-url/--to-web-url")
+        );
+        assert_eq!(unread_conflict(false, &link), None);
+    }
+
+    #[test]
+    fn unread_and_mark_read_refuse_the_loading_flags() {
+        let sql = [(false, "-t"), (true, "--sql")];
+        assert_eq!(loading_conflict(Some("--unread"), &sql).as_deref(), Some("--unread cannot be combined with --sql"));
+        assert_eq!(loading_conflict(None, &sql), None);
+        assert_eq!(loading_conflict(Some("--mark-read"), &[(false, "-t")]), None);
+    }
+
+    #[test]
+    fn the_as_of_time_printed_by_unread_is_accepted_by_until() {
+        let printed = Local::now().format(unread::AS_OF_FORMAT).to_string();
+        assert!(parse_local_time(&printed).is_ok(), "{printed}");
+    }
+
+    #[test]
+    fn until_takes_local_time_with_or_without_seconds() {
+        let with = parse_local_time("2026-11-23 11:45:09").unwrap();
+        let without = parse_local_time("2026-11-23T11:45").unwrap();
+        assert_eq!(with - without, 9.0);
+        assert!(parse_local_time("23.11.2026").is_err());
+    }
+
+    #[test]
+    fn an_explicit_offset_picks_the_instant_even_in_the_repeated_hour() {
+        let first = parse_local_time("2026-10-25 02:30:00 +02:00").unwrap();
+        let second = parse_local_time("2026-10-25 02:30:00 +01:00").unwrap();
+        assert_eq!(second - first, 3600.0);
+    }
+
+    #[test]
+    fn an_offset_works_without_seconds_too() {
+        let with = parse_local_time("2026-11-23 11:45:09 +01:00").unwrap();
+        let without = parse_local_time("2026-11-23T11:45 +01:00").unwrap();
+        assert_eq!(with - without, 9.0);
+        assert_eq!(with, 1795430709.0);
+    }
+
+    #[test]
+    fn a_local_time_that_exists_twice_takes_the_earlier_one() {
+        let (summer, winter) = (chrono::FixedOffset::east_opt(7200).unwrap(), chrono::FixedOffset::east_opt(3600).unwrap());
+        let naive = chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap().and_hms_opt(2, 30, 0).unwrap();
+        let both = chrono::LocalResult::Ambiguous(
+            summer.from_local_datetime(&naive).unwrap(),
+            winter.from_local_datetime(&naive).unwrap(),
+        );
+        assert_eq!(earliest_instant(both), Ok(summer.from_local_datetime(&naive).unwrap().timestamp() as f64));
+        assert!(earliest_instant::<chrono::FixedOffset>(chrono::LocalResult::None).is_err());
+    }
+
+    #[test]
+    fn a_group_dm_is_named_after_its_members() {
+        assert_eq!(group_dm_name("mpdm-schaefer--schmitt--grandl-1"), "Group: schaefer, schmitt, grandl");
     }
 
     #[test]
