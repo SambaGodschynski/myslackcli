@@ -48,6 +48,50 @@ keep the file out of the checkout (see Setup).
 ./myslackcli --help           # all flags
 ```
 
+### What's unread
+
+```bash
+./myslackcli --unread --no-color
+```
+
+Prints every conversation that has unread messages, the messages since your
+last read position, then every thread with unread replies, and exits. Order:
+whatever mentions you first, then DMs, group DMs, channels. This uses the same
+internal endpoints the Slack client draws its bold channel names from
+(`client.counts`, `subscriptions.thread.getView`), so it needs the browser
+session token, and it can break whenever Slack changes them. If a conversation
+can't be loaded, the rest is still shown and the run ends with a non-zero exit
+code naming what is missing.
+
+Each thread header carries the thread's tag, `== thread in #general [t:9x4t]: 2 unread ==`,
+and the messages below it start with `↳`. A message in a conversation section
+that has replies carries a `[t:…]` too; the `↳` is what makes a picked line mark
+the thread rather than the conversation. The later lines of a multi-line message
+start with `┆` and are never taken as a target.
+The first line says when the list was taken, by Slack's clock, `(as of 2026-11-23 11:45:09 +01:00 - pass it as --until)`.
+
+### Marking read
+
+```bash
+./myslackcli --unread > unread.txt                                       # look first
+./myslackcli --mark-read '#general' t:9x4t --until '2026-11-23 11:45:09 +01:00' # one or several
+fzf -m --ansi < unread.txt | ./myslackcli --mark-read - --until '2026-11-23 11:45:09 +01:00'
+./myslackcli --mark-read t:9x4t --dry-run                                # show, change nothing
+```
+
+A target is whatever `--unread` prints: a conversation name, a thread tag, or a
+whole output line (header or message), so a selection from `--unread` can be
+piped straight back. A raw channel id works too, also for a conversation the channel list leaves out,
+such as an archived channel, which `--unread` shows by its id. Each target is marked read up
+to its newest message at or before `--until`, a local time where `HH:MM` means
+`HH:MM:00`, or one with an offset like the `as of` line. Pass the time from the `as of` line, so that anything that arrived after you looked stays unread. Without
+`--until` the cut-off is the moment `--mark-read` runs, and whatever came in
+while you were reading gets marked read unseen. Threads are found by tag among the
+*unread* threads only; a thread that is already read has nothing to mark.
+A target that can't be marked (a typo, a line naming nothing, a thread read in
+the meantime) is reported, the others are still marked, and the run ends with a
+non-zero exit code.
+
 The timestamp is `%d.%m.%y %H:%M:%S` unless `--time-format` says otherwise; any
 strftime pattern works, and an empty one drops the field and its brackets rather
 than leaving `[]` at the start of every line. Note that Slack addresses messages
@@ -56,6 +100,12 @@ used to identify a message — that's what the id column is for.
 
 Mentions come out as names rather than ids: `@Ada Lovelace` for a person,
 `@team-qa` for a user group, `#general` for a channel reference.
+
+Group DMs are named after their members, `[Group: ada, grace, alan]`, in the
+live stream, the backfill and `--unread` alike, and `--sql` stores them with
+kind `group`. Two group DMs with the same members get the same name; to mark
+one of them read, pass its id, which `--mark-read` lists when the name is
+ambiguous.
 
 Messages that belong to a thread carry a short id like `[t:9x4t]` — the same one
 on every message of that thread, so filtering on `t:9x4t` pulls the whole
