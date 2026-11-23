@@ -14,3 +14,6 @@ dotenvy = "0.15"
 urlencoding = "2"
 chrono = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
